@@ -36,6 +36,7 @@ export function createSandbox() {
   delete env.PLUGIN_DATA;
   delete env.AGY_OFFLOAD_SANITIZE;
   delete env.AGY_OFFLOAD_ALIAS;
+  delete env.AGY_CONTROL_TOWER_DATA_DIR;
 
   return {
     root,

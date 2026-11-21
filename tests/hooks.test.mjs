@@ -340,7 +340,7 @@ describe('hooks 生命周期：按需零污染、Orchestrator 确认、Stop 递�
     // 重新模拟熔断，测试全新指令放行一次
     const stateFile = join(sb.dataDir, '.filter-retry-state.json');
     writeFileSync(stateFile, JSON.stringify({
-      selftest: { step: 12, tries: 3, dead: true, offload_mode: true, alias_injected: true, notified: false, ts: Date.now() / 1000 },
+      selftest: { step: 12, tries: 3, dead: true, offload_mode: true, alias_injected: true, rule_rev: 2, notified: false, ts: Date.now() / 1000 },
     }));
 
     const newOut = JSON.parse(runHook(NOTICE, {
@@ -390,5 +390,95 @@ describe('hooks 生命周期：按需零污染、Orchestrator 确认、Stop 递�
     const st = JSON.parse(readFileSync(stateFile, 'utf-8')).silent1;
     assert.match(st.note_dir, /\/silent-ws$/);
     assert.equal(Boolean(st.offload_mode), false);
+  });
+
+  it('control-tower 现役总控免静默误绑、显式启用合并零配额确认，且 RULE_REV=2 自动刷新存量会话', () => {
+    const sb = newSandbox();
+    const stateFile = join(sb.dataDir, '.filter-retry-state.json');
+    const wsRepo = join(sb.root, 'ct-repo');
+    mkdirSync(join(wsRepo, '.agents'), { recursive: true });
+    const ctConv = 'cc001122-aaaa-bbbb-cccc-ddddeeeeffff';
+    writeFileSync(
+      join(wsRepo, '.agents', 'SESSION-REGISTRY.md'),
+      `- **当前现役总控会话**：[\`cc001122\`](conversation://${ctConv}) | 状态：\`ONLINE\`\n`,
+      'utf-8',
+    );
+
+    // 1. 现役总控单提子任务路径，PreInvocation 跳过不写 state，Stop 也跳过不建目录
+    const skipNotice = runHook(NOTICE, {
+      conversationId: ctConv,
+      workspacePaths: [wsRepo],
+      lastUserInput: '请核查 ~/agy-notes/sub-task-1/status.md 并更新台账',
+    }, sb.env);
+    assert.equal(skipNotice, '{}');
+    assert.equal(existsSync(stateFile) ? Object.hasOwn(JSON.parse(readFileSync(stateFile, 'utf-8')), ctConv) : false, false);
+
+    const ctTranscript = join(sb.root, 'ct.jsonl');
+    writeTranscript(ctTranscript, [
+      { step_index: 1, type: 'USER_INPUT', content: '<USER_REQUEST>\n请核查 ~/agy-notes/sub-task-1/status.md\n</USER_REQUEST>' },
+      { step_index: 2, type: 'PLANNER_RESPONSE', output_tokens: 1200, content: "This request was blocked by Gemini's filters." },
+    ]);
+    const skipRetry = runHook(RETRY, {
+      conversationId: ctConv,
+      workspacePaths: [wsRepo],
+      transcriptPath: ctTranscript,
+    }, sb.env);
+    assert.equal(skipRetry, '{}');
+    assert.equal(existsSync(join(sb.noteRoot, 'sub-task-1')), false);
+
+    // 2. 现役总控 + Orchestrator 显式启用 /note-offload，合并弹出单张零配额确认卡，回复确认自动补发
+    const prompt = '/note-offload 分析当前架构并写入 ~/agy-notes/ct-own/task.md';
+    const confirmCard = JSON.parse(runHook(NOTICE, {
+      conversationId: ctConv,
+      workspacePaths: [wsRepo],
+      modelName: 'gemini-pro-orchestrator-neon',
+      lastUserInput: prompt,
+    }, sb.env));
+    assert.equal(confirmCard.terminationBehavior, 'terminate');
+    const md = confirmCard.injectSteps[0].systemMessage.metadata.user_markdown;
+    assert.match(md, /Orchestrator 模式启用落盘提醒/);
+    assert.match(md, /control-tower 现役总控/);
+
+    const accepted = JSON.parse(runHook(NOTICE, {
+      conversationId: ctConv,
+      workspacePaths: [wsRepo],
+      modelName: 'gemini-pro-orchestrator-neon',
+      lastUserInput: '确认',
+    }, sb.env));
+    assert.equal(accepted.terminationBehavior, undefined);
+    assert.equal(accepted.injectSteps[0].userMessage, prompt);
+    assert.match(accepted.injectSteps[1].systemMessage.systemMessage, /\[落盘模式\]/);
+
+    const stAfter = JSON.parse(readFileSync(stateFile, 'utf-8'))[ctConv];
+    assert.equal(stAfter.orch_confirmed, true);
+    assert.equal(stAfter.ct_confirmed, true);
+    assert.equal(stAfter.rule_rev, 2);
+
+    // 3. 存量旧会话（offload_mode=true, alias_injected=true 但无 rule_rev）自动触发 v2 规则刷新且不重复注入
+    const legacyConv = 'leg11223-aaaa-bbbb-cccc-ddddeeeeffff';
+    const cur = JSON.parse(readFileSync(stateFile, 'utf-8'));
+    cur[legacyConv] = {
+      step: 5,
+      offload_mode: true,
+      alias_injected: true,
+      note_dir: '~/agy-notes/legacy-ws',
+      ts: Date.now() / 1000,
+    };
+    writeFileSync(stateFile, JSON.stringify(cur));
+
+    const refreshed = JSON.parse(runHook(NOTICE, {
+      conversationId: legacyConv,
+      initialNumSteps: 10,
+      lastUserInput: '继续执行阶段 3',
+    }, sb.env));
+    assert.match(refreshed.injectSteps[0].systemMessage.systemMessage, /\[落盘模式规则已升级 v2\]/);
+    assert.equal(JSON.parse(readFileSync(stateFile, 'utf-8'))[legacyConv].rule_rev, 2);
+
+    const secondPass = runHook(NOTICE, {
+      conversationId: legacyConv,
+      initialNumSteps: 12,
+      lastUserInput: '再核对一次',
+    }, sb.env);
+    assert.equal(secondPass, '{}');
   });
 });

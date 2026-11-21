@@ -1,8 +1,17 @@
+import { createHash } from 'node:crypto';
 import { accessSync, constants, existsSync, readdirSync, readFileSync, realpathSync, statSync } from 'node:fs';
 import { delimiter, join, resolve } from 'node:path';
 import { hasConfiguredAliases, HEX8_CONV_RE, readAliases } from './aliases.mjs';
 import { loadConfig } from './config.mjs';
-import { getGlobalConfigDir, getPluginRoot } from './paths.mjs';
+import { getGlobalConfigDir, getHomeDir, getPluginRoot } from './paths.mjs';
+
+const REGISTRY_REL_CANDIDATES = [
+  '.agents/SESSION-REGISTRY.md',
+  'research/SESSION-REGISTRY.md',
+  'SESSION-REGISTRY.md',
+  '.agents/control-tower/registry.md',
+  'control-tower-registry.md',
+];
 
 function readJsonSafe(filePath) {
   if (!existsSync(filePath)) return null;
@@ -32,18 +41,69 @@ function isPluginExplicitlyDisabled(globalCfg, pluginDirName) {
   return Boolean(entry && typeof entry === 'object' && entry.enabled === false);
 }
 
-function checkControlTowerSession(convId, workspacePaths) {
-  if (!convId || !Array.isArray(workspacePaths) || workspacePaths.length === 0) return null;
-  const convShort = String(convId).trim().slice(0, 8);
-  if (convShort.length < 4) return null;
+function findControlTowerRegistries(workspacePaths, env = process.env, hintPath = '') {
+  if (!Array.isArray(workspacePaths) || workspacePaths.length === 0) return [];
+  const home = getHomeDir(env);
+  const surfaceMatch = String(hintPath || '').match(/\/\.gemini\/(antigravity(?:-cli|-ide)?)\//);
+  const surfaces = [...new Set([
+    ...(surfaceMatch ? [surfaceMatch[1]] : []),
+    'antigravity',
+    'antigravity-cli',
+    'antigravity-ide',
+  ])];
 
-  const relCandidates = ['.agents/control-tower/registry.md', 'control-tower-registry.md'];
-  for (const ws of workspacePaths) {
-    if (!ws || typeof ws !== 'string') continue;
-    for (const rel of relCandidates) {
+  const seenWs = new Set();
+  const found = new Set();
+
+  for (const rawWs of workspacePaths) {
+    if (!rawWs || typeof rawWs !== 'string') continue;
+    let wsReal;
+    try {
+      wsReal = existsSync(rawWs) ? realpathSync(rawWs) : resolve(rawWs);
+    } catch {
+      wsReal = resolve(rawWs);
+    }
+    if (seenWs.has(wsReal)) continue;
+    seenWs.add(wsReal);
+
+    for (const rel of REGISTRY_REL_CANDIDATES) {
+      const cand = join(wsReal, rel);
+      if (existsSync(cand)) found.add(cand);
+    }
+
+    const wsHash = createHash('sha256').update(wsReal, 'utf8').digest('hex').slice(0, 16);
+    if (env.AGY_CONTROL_TOWER_DATA_DIR) {
+      const overrideCand = join(resolve(env.AGY_CONTROL_TOWER_DATA_DIR), 'workspaces', wsHash, 'SESSION-REGISTRY.md');
+      if (existsSync(overrideCand)) found.add(overrideCand);
+    }
+    for (const surface of surfaces) {
+      const managedCand = join(home, '.gemini', surface, 'plugin_data', 'control-tower', 'workspaces', wsHash, 'SESSION-REGISTRY.md');
+      if (existsSync(managedCand)) found.add(managedCand);
+    }
+  }
+
+  return [...found];
+}
+
+/**
+ * 判断指定会话是否为任意工作区 control-tower 台账的现役总控会话。
+ * @param {{ convId?: string, workspacePaths?: string[], env?: NodeJS.ProcessEnv, hintPath?: string }} [options]
+ * @returns {boolean}
+ */
+export function isActiveControlTowerController({
+  convId = '',
+  workspacePaths = [],
+  env = process.env,
+  hintPath = '',
+} = {}) {
+  try {
+    if (!convId || !Array.isArray(workspacePaths) || workspacePaths.length === 0) return false;
+    const convShort = String(convId).trim().slice(0, 8);
+    if (convShort.length < 4) return false;
+
+    const registries = findControlTowerRegistries(workspacePaths, env, hintPath);
+    for (const regPath of registries) {
       try {
-        const regPath = join(ws, rel);
-        if (!existsSync(regPath)) continue;
         const lines = readFileSync(regPath, 'utf-8').split(/\r?\n/);
         for (let i = 0; i < lines.length; i += 1) {
           const line = lines[i];
@@ -54,17 +114,26 @@ function checkControlTowerSession(convId, workspacePaths) {
             ...windowText.matchAll(/`([A-Za-z0-9][A-Za-z0-9_-]{7,127})`/g),
           ].map((m) => m[1]);
           if (convHits.some((hit) => sameConvId(hit, convId)) || windowText.toLowerCase().includes(convShort.toLowerCase())) {
-            return {
-              code: 'control_tower_active_controller',
-              level: 'warn',
-              message: '当前会话疑似为 control-tower 现役总控会话，开启落盘或熔断拦截可能影响总控轮询与裸会话 ID 摄入',
-            };
+            return true;
           }
         }
       } catch {
-        // 忽略读取异常
+        // 忽略单个台账读取失败
       }
     }
+  } catch {
+    return false;
+  }
+  return false;
+}
+
+function checkControlTowerSession(convId, workspacePaths, env, hintPath) {
+  if (isActiveControlTowerController({ convId, workspacePaths, env, hintPath })) {
+    return {
+      code: 'control_tower_active_controller',
+      level: 'warn',
+      message: '当前会话疑似为 control-tower 现役总控会话，开启落盘或熔断拦截可能影响总控轮询与裸会话 ID 摄入',
+    };
   }
   return null;
 }
@@ -189,13 +258,14 @@ function checkPathShadowNeturl(cfg, env) {
 
 /**
  * 检测当前可选项及运行时环境与其他插件或官方配置间的潜在冲突风险。
- * @param {{ env?: NodeJS.ProcessEnv, convId?: string, workspacePaths?: string[], config?: { sanitizeEnabled?: boolean, aliasEnabled?: boolean } | null }} [options]
+ * @param {{ env?: NodeJS.ProcessEnv, convId?: string, workspacePaths?: string[], hintPath?: string, config?: { sanitizeEnabled?: boolean, aliasEnabled?: boolean } | null }} [options]
  * @returns {Array<{ code: string, level: 'warn' | 'info', message: string }>}
  */
 export function detectConflicts({
   env = process.env,
   convId = '',
   workspacePaths = [],
+  hintPath = '',
   config = null,
 } = {}) {
   const issues = [];
@@ -204,7 +274,7 @@ export function detectConflicts({
     const globalDir = getGlobalConfigDir(env);
     const globalCfg = readJsonSafe(join(globalDir, 'config.json'));
 
-    const ctIssue = checkControlTowerSession(convId, workspacePaths);
+    const ctIssue = checkControlTowerSession(convId, workspacePaths, env, hintPath);
     if (ctIssue) issues.push(ctIssue);
 
     issues.push(...checkAliasesConflicts(cfg, env, globalDir, globalCfg));

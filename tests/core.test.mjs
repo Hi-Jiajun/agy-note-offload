@@ -1,12 +1,13 @@
 import assert from 'node:assert/strict';
 import { execFile } from 'node:child_process';
-import { chmodSync, existsSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
+import { createHash } from 'node:crypto';
+import { chmodSync, existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, statSync, writeFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { afterEach, describe, it } from 'node:test';
 import { promisify } from 'node:util';
 import { addAliasStrict, hasConfiguredAliases, upsertAlias } from '../plugin/lib/aliases.mjs';
 import { loadConfig, saveConfig } from '../plugin/lib/config.mjs';
-import { detectConflicts } from '../plugin/lib/conflicts.mjs';
+import { detectConflicts, isActiveControlTowerController } from '../plugin/lib/conflicts.mjs';
 import { withFileLockSync } from '../plugin/lib/lock.mjs';
 import { ensureDataDir, getDataDir, getPluginRoot, getStatePath, shortPath } from '../plugin/lib/paths.mjs';
 import { applySanitizeIfEnabled, clean, latinLeftovers } from '../plugin/lib/sanitize.mjs';
@@ -270,5 +271,54 @@ describe('core 共享内核：路径隔离、配置可选项、冲突检测、�
     assert.equal(codes.has('alias_mcp_collision'), true);
     assert.equal(codes.has('multi_plugin_hook_overlap'), true);
     assert.equal(codes.has('path_shadow_neturl'), true);
+  });
+
+  it('isActiveControlTowerController 与 detectConflicts 支持 .agents/SESSION-REGISTRY.md 与 @plugin_data 哈希托管台账', () => {
+    const sb = newSandbox();
+
+    // 1. 工作区内 .agents/SESSION-REGISTRY.md
+    const wsAgents = join(sb.root, 'ws-agents');
+    mkdirSync(join(wsAgents, '.agents'), { recursive: true });
+    writeFileSync(
+      join(wsAgents, '.agents', 'SESSION-REGISTRY.md'),
+      '- **当前现役总控会话**：[`11223344`](conversation://11223344-aaaa-bbbb-cccc-ddddeeeeffff) | 状态：`ONLINE`\n',
+      'utf-8',
+    );
+    assert.equal(
+      isActiveControlTowerController({
+        convId: '11223344-aaaa-bbbb-cccc-ddddeeeeffff',
+        workspacePaths: [wsAgents],
+        env: sb.env,
+      }),
+      true,
+    );
+    assert.equal(
+      isActiveControlTowerController({
+        convId: '99887766-aaaa-bbbb-cccc-ddddeeeeffff',
+        workspacePaths: [wsAgents],
+        env: sb.env,
+      }),
+      false,
+    );
+
+    // 2. @plugin_data/workspaces/<sha256(wsReal).slice(0,16)>/SESSION-REGISTRY.md 托管台账
+    const wsManaged = join(sb.root, 'ws-managed');
+    mkdirSync(wsManaged, { recursive: true });
+    const wsReal = realpathSync(wsManaged);
+    const wsHash = createHash('sha256').update(wsReal, 'utf8').digest('hex').slice(0, 16);
+    const managedRegDir = join(sb.homeDir, '.gemini', 'antigravity', 'plugin_data', 'control-tower', 'workspaces', wsHash);
+    mkdirSync(managedRegDir, { recursive: true });
+    writeFileSync(
+      join(managedRegDir, 'SESSION-REGISTRY.md'),
+      '- **当前现役总控会话**：[`cafebabe`](conversation://cafebabe-1111-2222-3333-444455556666) | 状态：`ONLINE`\n',
+      'utf-8',
+    );
+
+    const issues = detectConflicts({
+      env: sb.env,
+      convId: 'cafebabe-1111-2222-3333-444455556666',
+      workspacePaths: [wsManaged],
+    });
+    assert.equal(issues.some((i) => i.code === 'control_tower_active_controller'), true);
   });
 });

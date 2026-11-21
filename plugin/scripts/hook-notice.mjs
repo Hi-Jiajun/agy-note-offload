@@ -1,12 +1,12 @@
 #!/usr/bin/env node
 /**
- * Antigravity PreInvocation hook: 工作台绑定 + Orchestrator 首次确认 + 退出开关 + /compact 解锁 + 防空转 + 按需别名/冲突检测。
+ * Antigravity PreInvocation hook: 总控免静默误绑 + 工作台绑定 + Orchestrator/总控合并确认 + 退出开关 + /compact 解锁 + 防空转 + RULE_REV 自动刷新 + 按需别名/冲突检测。
  */
 import { closeSync, existsSync, openSync, readFileSync, readSync, statSync } from 'node:fs';
 import { join } from 'node:path';
 import { hasConfiguredAliases } from '../lib/aliases.mjs';
 import { loadConfig } from '../lib/config.mjs';
-import { detectConflicts } from '../lib/conflicts.mjs';
+import { detectConflicts, isActiveControlTowerController } from '../lib/conflicts.mjs';
 import { getMapPath, getPluginRoot, shortPath } from '../lib/paths.mjs';
 import { applySanitizeIfEnabled } from '../lib/sanitize.mjs';
 import {
@@ -27,6 +27,7 @@ import {
 
 const EXPECTED = 'PreInvocation';
 const TAIL_BYTES = 131_072;
+const RULE_REV = 2;
 
 const OFFLOAD_RULE =
   '[落盘模式] 本会话采用双向文件工作流：单一目标目录为 {dir}（严禁同时往多个落盘目录双写）；' +
@@ -152,15 +153,26 @@ function isConfirmWord(text) {
   return Boolean(cleaned) && CONFIRM_WORDS.has(cleaned);
 }
 
-function buildOrchRiskCard(conv, entry) {
+function buildRiskConfirmCard(conv, entry, { needsOrchConfirm, needsCtConfirm }) {
   const noteDir = resolveNoteDir(conv, entry, { create: false });
-  return (
-    '> **Orchestrator 模式启用落盘提醒（零配额确认）**：\n' +
-    `> 检测到当前会话运行在 \`Orchestrator\` 双阶段模型，目标工作台为 \`${noteDir}\`。\n` +
-    '> - 规划阶段只读不可直接写盘，落盘与状态同步会移交执行模型多走一轮；\n' +
-    '> - 本插件已采用无损规划交接策略，不会压缩您的规划推理、改法与回退条件；\n' +
-    '> - 回复 **`确认`** 或 **`继续`** 将自动带原指令开启落盘模式；如需放弃或切换非 Orchestrator 模型，请直接发新指令。'
-  );
+  const lines = [];
+  if (needsOrchConfirm && needsCtConfirm) {
+    lines.push('> **Orchestrator 模式启用落盘提醒（含 control-tower 现役总控冲突提示，零配额确认）**：');
+  } else if (needsOrchConfirm) {
+    lines.push('> **Orchestrator 模式启用落盘提醒（零配额确认）**：');
+  } else {
+    lines.push('> **control-tower 现役总控启用落盘提醒（零配额确认）**：');
+  }
+  lines.push(`> 目标工作台目录预览：\`${noteDir}\`。`);
+  if (needsOrchConfirm) {
+    lines.push('> - 当前会话运行在 `Orchestrator` 双阶段模型，规划阶段只读不可直接写盘，落盘与状态同步会移交执行模型多走一轮；');
+    lines.push('> - 本插件已采用无损规划交接策略，不会压缩您的规划推理、改法与回退条件；');
+  }
+  if (needsCtConfirm) {
+    lines.push('> - 当前会话为 `control-tower` 现役总控会话，开启落盘或熔断拦截可能影响总控轮询与裸会话 ID 摄入，建议总控独立保留全局台账调度，不复用子任务落盘目录；');
+  }
+  lines.push('> - 回复 **`确认`** 或 **`继续`** 将自动带原指令开启落盘模式；如需放弃或切换会话/模型，请直接发新指令。');
+  return lines.join('\n');
 }
 
 function buildDeadCard(conv, entry, deadReason, blockKind) {
@@ -225,6 +237,21 @@ function main() {
   const hasInputField = Object.hasOwn(payload, 'lastUserInput') && payload.lastUserInput !== null && payload.lastUserInput !== undefined;
   const lastRaw = String(payload.lastUserInput || '');
   const cfg = loadConfig(process.env);
+  const wsPaths = [
+    ...new Set(
+      [
+        ...(Array.isArray(payload.workspacePaths) ? payload.workspacePaths : []),
+        ...(payload.cwd ? [payload.cwd] : []),
+      ].filter((p) => typeof p === 'string' && p.trim()),
+    ),
+  ];
+  const hintPath = String(payload.transcriptPath || payload.artifactDirectoryPath || '');
+  const isCtController = isActiveControlTowerController({
+    convId: conv,
+    workspacePaths: wsPaths,
+    env: process.env,
+    hintPath,
+  });
 
   if (lastRaw.trimStart().startsWith('/compact')) {
     let unlocked = false;
@@ -258,17 +285,20 @@ function main() {
 
   withStateLock(() => {
     const state = loadState();
-    let entry = state[conv];
+    const rawExisting = state[conv];
+    const existingEntry = rawExisting && typeof rawExisting === 'object' && !Array.isArray(rawExisting) ? rawExisting : null;
     const now = Date.now() / 1000;
 
     if (explicitOff) {
-      const next = entry && typeof entry === 'object' && !Array.isArray(entry) ? { ...entry } : {};
+      const next = existingEntry ? { ...existingEntry } : {};
       next.offload_mode = false;
       next.ts = now;
-      if (wsDir) next.note_dir = wsDir;
+      if (wsDir && !isCtController) next.note_dir = wsDir;
       if (curSig) next.last_input_sig = curSig;
       delete next.alias_injected;
+      delete next.rule_rev;
       delete next.pending_orch_prompt;
+      delete next.pending_confirm_reasons;
       delete next.defer_alias;
       delete next.conflict_warned;
       state[conv] = next;
@@ -279,7 +309,13 @@ function main() {
       return;
     }
 
-    if (!entry || typeof entry !== 'object' || Array.isArray(entry)) {
+    if (isCtController && !explicitOffload && !existingEntry?.pending_orch_prompt && !(existingEntry?.offload_mode && existingEntry?.ct_confirmed)) {
+      pendingLogs.push(`preinvocation skip_ct_controller conv=${conv}`);
+      return;
+    }
+
+    let entry = existingEntry;
+    if (!entry) {
       if (!explicitOffload && !wsDir) {
         return;
       }
@@ -300,7 +336,7 @@ function main() {
     const prevStep = entry.step;
     if (Number.isInteger(initSteps) && Number.isInteger(prevStep) && initSteps <= prevStep) {
       pendingLogs.push(`preinvocation rewind_reset conv=${conv} prev_step=${prevStep} init_steps=${initSteps}`);
-      if (explicitOffload || wsDir) {
+      if ((explicitOffload || wsDir) && (!isCtController || explicitOffload)) {
         const keptDir = wsDir || entry.note_dir;
         entry = { ts: now };
         if (keptDir) entry.note_dir = keptDir;
@@ -317,7 +353,7 @@ function main() {
       }
     }
 
-    if (wsDir && entry.note_dir !== wsDir) {
+    if (wsDir && entry.note_dir !== wsDir && (!isCtController || explicitOffload || entry.ct_confirmed)) {
       entry.note_dir = wsDir;
     }
 
@@ -327,8 +363,15 @@ function main() {
     if (entry.pending_orch_prompt) {
       if ((hasInputField && isConfirmWord(lastRaw)) || explicitOffload) {
         const savedPrompt = entry.pending_orch_prompt;
+        const reasons = Array.isArray(entry.pending_confirm_reasons) ? entry.pending_confirm_reasons : ['orchestrator'];
         delete entry.pending_orch_prompt;
-        entry.orch_confirmed = true;
+        delete entry.pending_confirm_reasons;
+        if (reasons.includes('orchestrator') || isOrchestratorSession(payload)) {
+          entry.orch_confirmed = true;
+        }
+        if (reasons.includes('control_tower') || isCtController) {
+          entry.ct_confirmed = true;
+        }
         entry.offload_mode = true;
         entry.ts = now;
         const savedWs = extractNoteDir(savedPrompt);
@@ -341,35 +384,47 @@ function main() {
           if (savedSig) entry.last_input_sig = savedSig;
           replayedSavedPrompt = true;
         }
-        pendingLogs.push(`preinvocation orch_confirmed conv=${conv}`);
+        pendingLogs.push(`preinvocation confirm_accepted conv=${conv} reasons=${reasons.join(',')}`);
       } else {
         delete entry.pending_orch_prompt;
+        delete entry.pending_confirm_reasons;
+        if (isCtController && !(entry.offload_mode && entry.ct_confirmed)) {
+          state[conv] = entry;
+          saveState(state);
+          pendingLogs.push(`preinvocation confirm_declined_ct conv=${conv}`);
+          return;
+        }
       }
     }
 
-    if (explicitOffload && !entry.orch_confirmed && isOrchestratorSession(payload)) {
-      entry.pending_orch_prompt = lastRaw;
-      entry.ts = now;
-      if (curSig) entry.last_input_sig = curSig;
-      state[conv] = entry;
-      saveState(state);
-      const card = buildOrchRiskCard(conv, entry);
-      pendingLogs.push(`preinvocation orch_confirm_prompt conv=${conv}`);
-      output = {
-        injectSteps: [
-          {
-            systemMessage: {
-              systemMessage: '',
-              metadata: { user_markdown: card },
-            },
-          },
-        ],
-        terminationBehavior: 'terminate',
-      };
-      return;
-    }
-
     if (explicitOffload) {
+      const needsOrchConfirm = !entry.orch_confirmed && isOrchestratorSession(payload);
+      const needsCtConfirm = !entry.ct_confirmed && isCtController;
+      if (needsOrchConfirm || needsCtConfirm) {
+        const reasons = [];
+        if (needsOrchConfirm) reasons.push('orchestrator');
+        if (needsCtConfirm) reasons.push('control_tower');
+        entry.pending_orch_prompt = lastRaw;
+        entry.pending_confirm_reasons = reasons;
+        entry.ts = now;
+        if (curSig) entry.last_input_sig = curSig;
+        state[conv] = entry;
+        saveState(state);
+        const card = buildRiskConfirmCard(conv, entry, { needsOrchConfirm, needsCtConfirm });
+        pendingLogs.push(`preinvocation confirm_prompt conv=${conv} reasons=${reasons.join(',')}`);
+        output = {
+          injectSteps: [
+            {
+              systemMessage: {
+                systemMessage: '',
+                metadata: { user_markdown: card },
+              },
+            },
+          ],
+          terminationBehavior: 'terminate',
+        };
+        return;
+      }
       entry.offload_mode = true;
     }
 
@@ -429,10 +484,15 @@ function main() {
     }
 
     const offloadMode = Boolean(entry.offload_mode) || (withinWindow && Number(entry.tries || 0) >= 2);
-    if (offloadMode && !entry.alias_injected) {
+    const needsRuleInject = !entry.alias_injected || Number(entry.rule_rev || 0) < RULE_REV;
+    if (offloadMode && needsRuleInject) {
+      const isUpgradeRefresh = Boolean(entry.alias_injected);
       entry.alias_injected = true;
+      entry.rule_rev = RULE_REV;
       const noteDir = resolveNoteDir(conv, entry, { create: false });
-      let ruleTpl = OFFLOAD_RULE;
+      let ruleTpl = isUpgradeRefresh
+        ? `[落盘模式规则已升级 v2] 请以以下新版规则替代本会话历史消息中的旧版落盘限制：\n${OFFLOAD_RULE}`
+        : OFFLOAD_RULE;
       if (cfg.aliasEnabled && hasConfiguredAliases(process.env)) {
         const neturlPath = shortPath(join(getPluginRoot(), 'scripts', 'neturl.mjs'));
         const mapPath = shortPath(getMapPath());
@@ -440,16 +500,16 @@ function main() {
       }
       const rule = applySanitizeIfEnabled(ruleTpl.replaceAll('{dir}', noteDir), process.env, cfg);
       steps.push({ systemMessage: { systemMessage: rule } });
-      pendingLogs.push(`preinvocation alias conv=${conv} dir=${noteDir}`);
+      pendingLogs.push(`preinvocation ${isUpgradeRefresh ? 'rule_refresh' : 'alias'} conv=${conv} dir=${noteDir}`);
     }
 
     if (offloadMode && !entry.conflict_warned) {
-      const wsPaths = Array.isArray(payload.workspacePaths) ? payload.workspacePaths : [];
       if (cfg.sanitizeEnabled || cfg.aliasEnabled || wsPaths.length > 0) {
         const conflicts = detectConflicts({
           env: process.env,
           convId: conv,
           workspacePaths: wsPaths,
+          hintPath,
           config: cfg,
         });
         if (conflicts.length > 0) {

@@ -1,8 +1,9 @@
 #!/usr/bin/env node
 /**
- * Antigravity Stop hook: 仅管理落盘/绑定会话，2 档续跑 + 跨轮 Plan Mode 分流 + 连续递增 turn-N + 快速熔断。
+ * Antigravity Stop hook: 仅管理已开启落盘或非总控绑定会话，2 档续跑 + 跨轮 Plan Mode 分流 + 连续递增 turn-N + 快速熔断。
  */
 import { closeSync, existsSync, openSync, readFileSync, readSync, statSync } from 'node:fs';
+import { isActiveControlTowerController } from '../lib/conflicts.mjs';
 import { applySanitizeIfEnabled } from '../lib/sanitize.mjs';
 import {
   appendLog,
@@ -197,6 +198,20 @@ function main() {
   const curStep = rec.step_index;
   const body = typeof rec.content === 'string' ? rec.content : '';
   const uInfo = extractLastUserInfo(recs);
+  const wsPaths = [
+    ...new Set(
+      [
+        ...(Array.isArray(payload.workspacePaths) ? payload.workspacePaths : []),
+        ...(payload.cwd ? [payload.cwd] : []),
+      ].filter((p) => typeof p === 'string' && p.trim()),
+    ),
+  ];
+  const isCtController = isActiveControlTowerController({
+    convId: conv,
+    workspacePaths: wsPaths,
+    env: process.env,
+    hintPath: transcript,
+  });
 
   let decisionPayload = null;
   let logLine = '';
@@ -210,10 +225,15 @@ function main() {
     if (rewound) {
       appendLog(`stop conv=${conv} rewind_reset prev_step=${prevStep} cur_step=${curStep}`);
       const kept = {};
-      for (const k of ['alias_injected', 'offload_mode', 'note_dir', 'orch_confirmed', 'conflict_warned']) {
+      for (const k of ['alias_injected', 'offload_mode', 'note_dir', 'orch_confirmed', 'ct_confirmed', 'conflict_warned', 'rule_rev']) {
         if (entry[k]) kept[k] = entry[k];
       }
       entry = kept;
+    }
+
+    if (isCtController && !(entry.offload_mode && entry.ct_confirmed)) {
+      logLine = `stop conv=${conv} skip=ct_controller`;
+      return;
     }
 
     const managed =
@@ -247,7 +267,7 @@ function main() {
         }
         entryKeep.step = curStep;
         entryKeep.ts = now;
-        if (entryKeep.alias_injected || entryKeep.offload_mode || entryKeep.note_dir || entryKeep.orch_confirmed) {
+        if (entryKeep.alias_injected || entryKeep.offload_mode || entryKeep.note_dir || entryKeep.orch_confirmed || entryKeep.ct_confirmed || entryKeep.rule_rev) {
           state[conv] = entryKeep;
         } else {
           delete state[conv];
@@ -270,7 +290,7 @@ function main() {
     }
 
     const preserved = {};
-    for (const k of ['alias_injected', 'offload_mode', 'note_dir', 'last_input_sig', 'orch_confirmed', 'conflict_warned']) {
+    for (const k of ['alias_injected', 'offload_mode', 'note_dir', 'last_input_sig', 'orch_confirmed', 'ct_confirmed', 'conflict_warned', 'rule_rev']) {
       if (entry[k]) preserved[k] = entry[k];
     }
 
