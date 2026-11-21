@@ -236,6 +236,118 @@ before=$(stat -c%s "$TEST_DATA_DIR/hook-invocations.log" 2>/dev/null || stat -f%
 after=$(stat -c%s "$TEST_DATA_DIR/hook-invocations.log" 2>/dev/null || stat -f%z "$TEST_DATA_DIR/hook-invocations.log" 2>/dev/null || echo 0)
 [ "$after" -lt "$before" ] && pass "DATA_DIR 日志轮转正常" || fail "日志未轮转 ($before -> $after)"
 
+# 12) Sidecar Aux Pane 元数据、语法检查与端到端 HTTP API 自检
+NODE_BIN="$(command -v node || true)"
+if "$PYTHON_BIN" - <<'PY'
+import json, os
+sj = json.load(open("sidecars/board/sidecar.json", encoding="utf-8"))
+assert sj.get("has_web_ui") is True
+views = (sj.get("ui_config") or {}).get("views") or []
+assert any(v.get("entrypoint") == "SIDECAR_UI_ENTRYPOINT_AUX_PANE" for v in views)
+for f in ("package.json", "main.mjs", "index.html", "styles.css", "app.js"):
+    assert os.path.exists(os.path.join("sidecars/board", f))
+PY
+then pass "sidecar.json 与 Aux Pane 前端资产完整"; else fail "sidecar.json 元数据或资产缺失"; fi
+
+if [ -n "$NODE_BIN" ] && "$NODE_BIN" --check ./sidecars/board/main.mjs ./sidecars/board/app.js 2>/dev/null; then
+  pass "Sidecar JS 语法检查通过"
+
+  TEST_NOTE_ROOT=$(mktemp -d "$TMP_BASE/selftest-noteroot.XXXXXX")
+  TEST_SC_DATA=$(mktemp -d "$TMP_BASE/selftest-scdata.XXXXXX")
+  SC_PORT=$("$PYTHON_BIN" -c "import socket;s=socket.socket();s.bind(('127.0.0.1',0));print(s.getsockname()[1]);s.close()")
+  SC_TOKEN="selftest-token-123"
+
+  AGY_NOTE_ROOT="$TEST_NOTE_ROOT" \
+  AGY_OFFLOAD_DATA_DIR="$TEST_SC_DATA" \
+  ANTIGRAVITY_SIDECAR_WEB_PORT="$SC_PORT" \
+  ANTIGRAVITY_SIDECAR_UI_TOKEN="$SC_TOKEN" \
+  "$NODE_BIN" ./sidecars/board/main.mjs >/dev/null 2>&1 &
+  SC_PID=$!
+
+  if "$PYTHON_BIN" - "$SC_PORT" "$SC_TOKEN" "$TEST_NOTE_ROOT" "$TEST_SC_DATA" <<'PY'
+import json, os, sys, time, urllib.error, urllib.request
+
+port, token, note_root, data_dir = sys.argv[1:5]
+base = f"http://127.0.0.1:{port}"
+
+def req(method, path, body=None, use_token=True):
+    headers = {}
+    if use_token:
+        headers["x-sidecar-token"] = token
+    data = None
+    if body is not None:
+        headers["Content-Type"] = "application/json"
+        data = json.dumps(body).encode("utf-8")
+    r = urllib.request.Request(base + path, data=data, headers=headers, method=method)
+    try:
+        with urllib.request.urlopen(r, timeout=3) as resp:
+            return resp.status, resp.read().decode("utf-8")
+    except urllib.error.HTTPError as e:
+        return e.code, e.read().decode("utf-8")
+
+# 等待服务就绪
+ready = False
+for _ in range(30):
+    try:
+        st, html = req("GET", "/", use_token=False)
+        if st == 200 and "/preload.js" in html:
+            ready = True
+            break
+    except Exception:
+        time.sleep(0.1)
+assert ready, "sidecar did not start in time"
+
+# 1. 无 token POST 必须返回 401
+st, _ = req("POST", "/api/workspace/init", {"name": "ws1"}, use_token=False)
+assert st == 401, f"expected 401 without token, got {st}"
+
+# 2. 初始化工作台 + 在线保存 task.md + 快照与文件读取
+st, raw = req("POST", "/api/workspace/init", {"name": "ws1", "taskContent": "# T1\nhello\n"})
+assert st == 200 and json.loads(raw)["ok"] is True
+st, raw = req("POST", "/api/workspace/save", {"workspace": "ws1", "file": "task.md", "content": "# T1 updated\n"})
+assert st == 200 and json.loads(raw)["ok"] is True
+st, raw = req("GET", "/api/file?workspace=ws1&file=task.md")
+assert st == 200 and json.loads(raw)["content"] == "# T1 updated\n"
+
+# 3. 禁止覆写非 task/status 文件 + 路径穿越拦截
+open(os.path.join(note_root, "ws1", "turn-1.md"), "w").write("frozen")
+st, _ = req("POST", "/api/workspace/save", {"workspace": "ws1", "file": "turn-1.md", "content": "hack"})
+assert st == 403, f"expected 403 for turn-1 write, got {st}"
+st, _ = req("GET", "/api/file?workspace=../etc&file=passwd")
+assert st in (400, 403), f"path traversal not blocked: {st}"
+
+# 4. 别名增删 + 状态重置 + snapshot 检验
+st, raw = req("POST", "/api/alias/upsert", {"key": "gw-z", "value": "https://api-z.example.com", "note": "test"})
+assert st == 200 and any(a["key"] == "gw-z" for a in json.loads(raw)["aliases"])
+st, raw = req("POST", "/api/alias/delete", {"key": "gw-z"})
+assert st == 200 and not any(a["key"] == "gw-z" for a in json.loads(raw)["aliases"])
+
+json.dump({"deadconv1234": {"tries": 3, "dead": True, "dead_reason": "max_retry", "ts": time.time()}},
+          open(os.path.join(data_dir, ".filter-retry-state.json"), "w"))
+st, raw = req("GET", "/api/snapshot")
+snap = json.loads(raw)
+assert len(snap["workspaces"]) == 1 and snap["trackedSessions"][0]["dead"] is True
+st, _ = req("POST", "/api/state/reset", {"conversationId": "deadconv1234"})
+assert st == 200
+st, raw = req("GET", "/api/snapshot")
+assert json.loads(raw)["trackedSessions"][0]["dead"] is False
+
+# 5. 清理空目录
+os.makedirs(os.path.join(note_root, "empty-ws"), exist_ok=True)
+st, raw = req("POST", "/api/workspace/clean", {})
+assert st == 200 and json.loads(raw)["removedCount"] == 1
+PY
+  then pass "Sidecar 侧边栏后端端到端 HTTP 鉴权、读写、熔断重置与防穿越全通过"
+  else fail "Sidecar HTTP 端到端自检失败"
+  fi
+
+  kill "$SC_PID" 2>/dev/null || true
+  wait "$SC_PID" 2>/dev/null || true
+  rm -rf "$TEST_NOTE_ROOT" "$TEST_SC_DATA"
+else
+  fail "Sidecar JS 语法检查失败或缺少 node"
+fi
+
 rm -rf "$TEST_DATA_DIR" "$T"
 
 echo "----"

@@ -17,7 +17,7 @@ LEGACY_SKILL_DIR="$CONFIG_DIR/skills/note-offload"
 LEGACY_HOOKS_JSON="$CONFIG_DIR/hooks.json"
 PYTHON_BIN="$(command -v python3 || echo /usr/bin/python3)"
 
-mkdir -p "$PLUGIN_DIR/assets" "$PLUGIN_DIR/scripts" "$PLUGIN_DIR/skills/note-offload" "$DATA_DIR" "$BIN_DIR"
+mkdir -p "$PLUGIN_DIR/assets" "$PLUGIN_DIR/scripts" "$PLUGIN_DIR/skills/note-offload" "$PLUGIN_DIR/sidecars/board" "$DATA_DIR" "$BIN_DIR"
 
 # 1) 安装/同步原生插件包文件（若直接在 PLUGIN_DIR 内运行则跳过自我拷贝）
 if [ "$(readlink -f "$REPO_DIR")" != "$(readlink -f "$PLUGIN_DIR")" ]; then
@@ -27,6 +27,9 @@ if [ "$(readlink -f "$REPO_DIR")" != "$(readlink -f "$PLUGIN_DIR")" ]; then
   cp "$REPO_DIR/LICENSE" "$PLUGIN_DIR/LICENSE"
   cp "$REPO_DIR/assets/logo.svg" "$PLUGIN_DIR/assets/logo.svg"
   cp "$REPO_DIR/skills/note-offload/SKILL.md" "$PLUGIN_DIR/skills/note-offload/SKILL.md"
+  for s in package.json sidecar.json main.mjs index.html styles.css app.js; do
+    cp "$REPO_DIR/sidecars/board/$s" "$PLUGIN_DIR/sidecars/board/$s"
+  done
   for f in \
     hooklib.py \
     sanitize.py \

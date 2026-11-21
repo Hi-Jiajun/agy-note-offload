@@ -4,7 +4,8 @@
 
 ## 核心能力
 
-- **原生插件形态**：标准 `plugin.json` + `hooks.json` + `skills/note-offload/`，放进 `~/.gemini/config/plugins/note-offload/` 即被 Antigravity 自动发现，支持在定制化面板实时一键启停。
+- **原生插件形态**：标准 `plugin.json` + `hooks.json` + `skills/note-offload/` + `sidecars/board/`，放进 `~/.gemini/config/plugins/note-offload/` 即被 Antigravity 自动发现，支持在扩展侧边栏与插件页一键使用及启停。
+- **可视化侧边栏面板（`扩展 > Note Offload`）**：内置零外部依赖 Sidecar Web UI，可直接在右侧栏浏览工作台健康度、在线编辑保存 `task.md`/`status.md`、一键复制启动词/新开接力会话、管理脱敏别名表以及手动解除熔断。
 - **双向文件交流（`agynote`）**：长篇需求放进 `task.md`，阶段进展同步更新 `status.md` 与 `turn-N.md`；聊天框全程只发 1 句短指令、只回 1 行指针，换模型或开新会话直接读看板无损接力。
 - **自动工作台绑定与惰性目录**：自动从指令中识别 `~/agy-notes/<工作台名>/` 绑定到当前会话，消除与 `<conv8>` 的双写分裂；普通对话不再提前创建空目录，配合 `agynote clean` 一键清理历史空文件夹。
 - **`Plan Mode` / `Orchestrator` 专用分流**：检测到处于只读规划阶段（禁用 `write_file`）时，自动引导 `exit_plan_mode` 传 5 行内纯路径计划交给执行模型，避免死锁。
@@ -19,6 +20,14 @@ note-offload/
 ├── assets/logo.svg                    # 插件图标
 ├── install.sh                         # 一键安装为原生插件 + 平滑迁移旧配置 + CLI 软链
 ├── uninstall.sh                       # 干净卸载（保留 ~/.local/share/agy-note-offload 与 ~/agy-notes）
+├── sidecars/
+│   └── board/                         # 右侧栏 Aux Pane Sidecar Web UI（零第三方依赖）
+│       ├── sidecar.json               # 声明 SIDECAR_UI_ENTRYPOINT_AUX_PANE
+│       ├── package.json
+│       ├── main.mjs
+│       ├── index.html
+│       ├── styles.css
+│       └── app.js
 ├── scripts/
 │   ├── hooklib.py                     # DATA_DIR 隔离、工作台提取绑定、惰性目录与状态管理
 │   ├── sanitize.py                    # 集中脱敏与拉丁词残留校验

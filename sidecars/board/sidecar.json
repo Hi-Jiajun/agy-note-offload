@@ -1,0 +1,21 @@
+{
+  "command": "node",
+  "args": ["main.mjs"],
+  "restart_policy": "always",
+  "display_name": "Note Offload",
+  "description": "双向落盘工作台（task.md / status.md / turn-N.md）可视化管理、会话熔断状态与别名表编辑器。",
+  "has_web_ui": true,
+  "agent_permissions": {
+    "allows_user_interactions": false
+  },
+  "ui_config": {
+    "display_name": "Note Offload",
+    "views": [
+      {
+        "path": "/",
+        "entrypoint": "SIDECAR_UI_ENTRYPOINT_AUX_PANE",
+        "title": "Note Offload"
+      }
+    ]
+  }
+}
