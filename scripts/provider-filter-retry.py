@@ -89,7 +89,7 @@ def is_plan_mode(rec, recs):
     model = (rec.get("model") or "").lower()
     if "orchestrator" in model:
         return True
-    for r in reversed(recs[-40:]):
+    for r in reversed(recs):
         if r.get("type") != "SYSTEM_MESSAGE":
             continue
         c = r.get("content") or ""
@@ -144,107 +144,109 @@ def main():
     rec = recs[-1]
 
     now = time.time()
-    state = hooklib.load_state()
-    entry = state.get(conv) or {}
     cur_step = rec.get("step_index")
-    prev_step = entry.get("step")
-
-    # 检测用户撤回（Undo / 编辑重发导致 step_index 回退）：旧熔断/计数全部作废
-    rewound = isinstance(cur_step, int) and isinstance(prev_step, int) and cur_step < prev_step
-    if rewound:
-        hooklib.log("stop conv=%s rewind_reset prev_step=%s cur_step=%s" % (conv, prev_step, cur_step))
-        entry = {}
-
     body = rec.get("content") or ""
-    # 只认「短回复且含拦截字样」：模型正文引用该句原文时不误判
-    if MARKER not in body or len(body) > 600:
-        if conv in state:
-            entry_keep = {} if rewound else dict(state[conv])
-            for k in ("tries", "zero_streak", "dead", "dead_reason", "notified", "defer_alias"):
-                entry_keep.pop(k, None)
-            entry_keep["step"] = cur_step
-            entry_keep["ts"] = now
-            if entry_keep.get("alias_injected") or entry_keep.get("offload_mode") or entry_keep.get("note_dir"):
-                state[conv] = entry_keep
-            else:
-                state.pop(conv, None)
+
+    with hooklib.state_lock():
+        state = hooklib.load_state()
+        entry = state.get(conv) or {}
+        prev_step = entry.get("step")
+
+        # 检测用户撤回（Undo / 编辑重发导致 step_index 回退）：旧熔断/计数全部作废
+        rewound = isinstance(cur_step, int) and isinstance(prev_step, int) and cur_step < prev_step
+        if rewound:
+            hooklib.log("stop conv=%s rewind_reset prev_step=%s cur_step=%s" % (conv, prev_step, cur_step))
+            entry = {}
+
+        # 只认「短回复且含拦截字样」：模型正文引用该句原文时不误判
+        if MARKER not in body or len(body) > 600:
+            if conv in state:
+                entry_keep = {} if rewound else dict(state[conv])
+                for k in ("tries", "zero_streak", "dead", "dead_reason", "notified", "defer_alias"):
+                    entry_keep.pop(k, None)
+                entry_keep["step"] = cur_step
+                entry_keep["ts"] = now
+                if entry_keep.get("alias_injected") or entry_keep.get("offload_mode") or entry_keep.get("note_dir"):
+                    state[conv] = entry_keep
+                else:
+                    state.pop(conv, None)
+                hooklib.save_state(state)
+            print("{}")
+            return
+
+        within_window = (not rewound) and (now - float(entry.get("ts") or 0) <= RETRY_WINDOW)
+        zero_out = is_zero_output_block(rec)
+        if within_window:
+            tries = int(entry.get("tries") or 0) + 1
+            zero_streak = (int(entry.get("zero_streak") or 0) + 1) if zero_out else 0
+        else:
+            tries = 1
+            zero_streak = 1 if zero_out else 0
+
+        preserved = {}
+        if isinstance(entry, dict):
+            for k in ("alias_injected", "offload_mode", "note_dir", "last_input_sig"):
+                if entry.get(k):
+                    preserved[k] = entry[k]
+
+        entry = dict(entry) if within_window else preserved
+
+        # 顺手从尾部 USER_INPUT 回填 last_input_sig 与工作台绑定（普通会话首拦也能拿到完整信息）
+        u_sig, u_dir = extract_last_user_info(recs)
+        if u_sig and not entry.get("last_input_sig"):
+            entry["last_input_sig"] = u_sig
+        if u_dir and not entry.get("note_dir"):
+            entry["note_dir"] = u_dir
+
+        entry.update({
+            "step": cur_step,
+            "tries": tries,
+            "zero_streak": zero_streak,
+            "ts": now,
+        })
+
+        # 连续零输出预检拦截：上下文已锁定，立即熔断停机
+        if zero_streak >= ZERO_OUT_LIMIT:
+            entry.pop("defer_alias", None)
+            entry.update({"dead": True, "dead_reason": "context_locked"})
+            state[conv] = entry
             hooklib.save_state(state)
-        print("{}")
-        return
+            hooklib.log("stop conv=%s ladder=dead reason=context_locked tries=%s zero_streak=%s" % (conv, tries, zero_streak))
+            print("{}")
+            return
 
-    within_window = (not rewound) and (now - float(entry.get("ts") or 0) <= RETRY_WINDOW)
-    zero_out = is_zero_output_block(rec)
-    if within_window:
-        tries = int(entry.get("tries") or 0) + 1
-        zero_streak = (int(entry.get("zero_streak") or 0) + 1) if zero_out else 0
-    else:
-        tries = 1
-        zero_streak = 1 if zero_out else 0
+        # 超过 2 档上限：直接熔断停机，不再硬跑第 3 轮
+        if tries > MAX_RETRY:
+            entry.pop("defer_alias", None)
+            entry.update({"dead": True, "dead_reason": "max_retry"})
+            state[conv] = entry
+            hooklib.save_state(state)
+            hooklib.log("stop conv=%s ladder=dead reason=max_retry tries=%s" % (conv, tries))
+            print("{}")
+            return
 
-    preserved = {}
-    if isinstance(entry, dict):
-        for k in ("alias_injected", "offload_mode", "note_dir", "last_input_sig"):
-            if entry.get(k):
-                preserved[k] = entry[k]
+        plan_mode = is_plan_mode(rec, recs)
+        long_answer = int(rec.get("output_tokens") or 0) >= LONG_ANSWER
+        total_ctx = int(rec.get("input_tokens") or 0) + int(rec.get("cache_read_tokens") or 0)
+        big_ctx = total_ctx >= BIG_CONTEXT
 
-    entry = dict(entry) if within_window else preserved
+        if plan_mode:
+            tier, reason_tpl = "plan", PLAN_OFFLOAD_MODE
+            entry["offload_mode"] = True
+            entry["defer_alias"] = True
+            note_dir = hooklib.resolve_note_dir(conv, entry, create=False)
+        elif tries == 1 and not long_answer and not big_ctx:
+            tier, reason_tpl = 1, REWORD
+            entry.pop("defer_alias", None)
+            note_dir = hooklib.resolve_note_dir(conv, entry, create=False)
+        else:
+            tier, reason_tpl = 2, OFFLOAD_MODE
+            entry["offload_mode"] = True
+            entry["defer_alias"] = True
+            note_dir = hooklib.resolve_note_dir(conv, entry, create=True)
 
-    # 顺手从尾部 USER_INPUT 回填 last_input_sig 与工作台绑定（普通会话首拦也能拿到完整信息）
-    u_sig, u_dir = extract_last_user_info(recs)
-    if u_sig and not entry.get("last_input_sig"):
-        entry["last_input_sig"] = u_sig
-    if u_dir and not entry.get("note_dir"):
-        entry["note_dir"] = u_dir
-
-    entry.update({
-        "step": cur_step,
-        "tries": tries,
-        "zero_streak": zero_streak,
-        "ts": now,
-    })
-
-    # 连续零输出预检拦截：上下文已锁定，立即熔断停机
-    if zero_streak >= ZERO_OUT_LIMIT:
-        entry.pop("defer_alias", None)
-        entry.update({"dead": True, "dead_reason": "context_locked"})
         state[conv] = entry
         hooklib.save_state(state)
-        hooklib.log("stop conv=%s ladder=dead reason=context_locked tries=%s zero_streak=%s" % (conv, tries, zero_streak))
-        print("{}")
-        return
-
-    # 超过 2 档上限：直接熔断停机，不再硬跑第 3 轮
-    if tries > MAX_RETRY:
-        entry.pop("defer_alias", None)
-        entry.update({"dead": True, "dead_reason": "max_retry"})
-        state[conv] = entry
-        hooklib.save_state(state)
-        hooklib.log("stop conv=%s ladder=dead reason=max_retry tries=%s" % (conv, tries))
-        print("{}")
-        return
-
-    plan_mode = is_plan_mode(rec, recs)
-    long_answer = int(rec.get("output_tokens") or 0) >= LONG_ANSWER
-    total_ctx = int(rec.get("input_tokens") or 0) + int(rec.get("cache_read_tokens") or 0)
-    big_ctx = total_ctx >= BIG_CONTEXT
-
-    if plan_mode:
-        tier, reason_tpl = "plan", PLAN_OFFLOAD_MODE
-        entry["offload_mode"] = True
-        entry["defer_alias"] = True
-        note_dir = hooklib.resolve_note_dir(conv, entry, create=False)
-    elif tries == 1 and not long_answer and not big_ctx:
-        tier, reason_tpl = 1, REWORD
-        entry.pop("defer_alias", None)
-        note_dir = hooklib.resolve_note_dir(conv, entry, create=False)
-    else:
-        tier, reason_tpl = 2, OFFLOAD_MODE
-        entry["offload_mode"] = True
-        entry["defer_alias"] = True
-        note_dir = hooklib.resolve_note_dir(conv, entry, create=True)
-
-    state[conv] = entry
-    hooklib.save_state(state)
 
     reason = sanitize.clean(reason_tpl.format(dir=note_dir, n=cur_step or tries))
     hooklib.log(

@@ -1,3 +1,4 @@
+import { randomBytes, timingSafeEqual } from 'node:crypto';
 import { createServer } from 'node:http';
 import {
   existsSync,
@@ -8,6 +9,7 @@ import {
   renameSync,
   rmdirSync,
   statSync,
+  unlinkSync,
   writeFileSync,
 } from 'node:fs';
 import { homedir } from 'node:os';
@@ -24,6 +26,7 @@ const EXAMPLE_MAP_PATH = resolve(join(__dirname, '..', '..', 'scripts', 'net-map
 
 const RETRY_WINDOW_SEC = 15 * 60;
 const MAX_READ_BYTES = 256 * 1024;
+const MAX_BODY_BYTES = 2 * 1024 * 1024;
 const WS_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
 const FILE_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,95}\.(md|txt|json|log)$/;
 const EDITABLE_FILES = new Set(['task.md', 'status.md']);
@@ -73,6 +76,7 @@ function findPreloadJs() {
   const candidates = [
     process.env.ANTIGRAVITY_APP_DATA_DIR &&
       join(process.env.ANTIGRAVITY_APP_DATA_DIR, 'lib', 'node_modules', 'sidecar_sdk', 'preload.js'),
+    join(homedir(), '.gemini', 'config', 'node_modules', 'sidecar_sdk', 'preload.js'),
     join(homedir(), '.gemini', 'antigravity', 'lib', 'node_modules', 'sidecar_sdk', 'preload.js'),
   ].filter(Boolean);
   for (const p of candidates) {
@@ -119,10 +123,13 @@ class MiniSidecarApp {
   }
 
   #validateToken(req, url) {
-    if (url.pathname === '/preload.js') return true;
     if (!this.#token) return true;
-    const provided = req.headers['x-sidecar-token'] || url.searchParams.get('token');
-    return provided === this.#token;
+    const raw = req.headers['x-sidecar-token'] ?? url.searchParams.get('token') ?? '';
+    const provided = Array.isArray(raw) ? raw[0] : String(raw);
+    const a = Buffer.from(provided, 'utf-8');
+    const b = Buffer.from(this.#token, 'utf-8');
+    if (a.length !== b.length) return false;
+    return timingSafeEqual(a, b);
   }
 
   run() {
@@ -132,7 +139,8 @@ class MiniSidecarApp {
     const server = createServer(async (req, res) => {
       const url = new URL(req.url || '/', 'http://127.0.0.1');
 
-      if (req.method !== 'GET' && !this.#validateToken(req, url)) {
+      const requiresAuth = req.method !== 'GET' || url.pathname.startsWith('/api/');
+      if (requiresAuth && !this.#validateToken(req, url)) {
         res.writeHead(401, { 'Content-Type': 'application/json; charset=utf-8' });
         res.end(JSON.stringify({ error: 'unauthorized' }));
         return;
@@ -169,11 +177,24 @@ class MiniSidecarApp {
           return;
         }
         const handler = methodMap.get(req.method);
-        let body = '';
+        const chunks = [];
+        let totalBytes = 0;
+        let tooLarge = false;
+        req.on('error', () => {});
         req.on('data', (chunk) => {
-          body += chunk;
+          if (tooLarge) return;
+          totalBytes += chunk.length;
+          if (totalBytes > MAX_BODY_BYTES) {
+            tooLarge = true;
+            res.writeHead(413, { 'Content-Type': 'application/json; charset=utf-8' });
+            res.end(JSON.stringify({ error: '请求体过大（上限 2 MB）' }));
+            req.destroy();
+            return;
+          }
+          chunks.push(chunk);
         });
         req.on('end', async () => {
+          if (tooLarge) return;
           try {
             const data = {};
             if (url.searchParams.size > 0) {
@@ -181,8 +202,18 @@ class MiniSidecarApp {
                 if (k.toLowerCase() !== 'token') data[k] = v;
               }
             }
+            const body = chunks.length ? Buffer.concat(chunks).toString('utf-8') : '';
             if (body) {
-              Object.assign(data, JSON.parse(body));
+              let parsed;
+              try {
+                parsed = JSON.parse(body);
+              } catch {
+                throw new HttpError(400, '请求体 JSON 格式非法');
+              }
+              if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+                throw new HttpError(400, '请求体必须为 JSON 对象');
+              }
+              Object.assign(data, parsed);
             }
             const result = await handler(data);
             if (result && typeof result === 'object' && result.contentType && result.body !== undefined) {
@@ -231,7 +262,29 @@ function nowText() {
 
 function toShortPath(absPath) {
   const home = homedir();
+  if (absPath === home) return '~';
   return absPath.startsWith(home + sep) ? '~' + absPath.slice(home.length) : absPath;
+}
+
+const NOTE_ROOT_SHORT = toShortPath(NOTE_ROOT);
+
+function extractWsName(nd, cid) {
+  if (typeof nd === 'string' && nd) {
+    const prefixes = [
+      '~/agy-notes/',
+      `${NOTE_ROOT_SHORT.replace(/\/+$/, '')}/`,
+      `${NOTE_ROOT.replace(/\/+$/, '')}/`,
+    ];
+    for (const pfx of prefixes) {
+      if (nd.startsWith(pfx)) {
+        const rel = nd.slice(pfx.length).replace(/\/+$/, '');
+        if (rel && !rel.includes('/') && !rel.includes('..') && WS_RE.test(rel)) {
+          return rel;
+        }
+      }
+    }
+  }
+  return cid.slice(0, 8);
 }
 
 function assertOwnedSubpath(rootDir, targetPath) {
@@ -263,9 +316,16 @@ function resolveWorkspaceFile(wsName, fileName) {
 
 function atomicWrite(targetPath, text) {
   mkdirSync(dirname(targetPath), { recursive: true });
-  const tmp = join(dirname(targetPath), `.tmp-${process.pid}-${Date.now()}`);
-  writeFileSync(tmp, text, 'utf-8');
-  renameSync(tmp, targetPath);
+  const tmp = join(dirname(targetPath), `.tmp-${process.pid}-${Date.now()}-${randomBytes(4).toString('hex')}`);
+  try {
+    writeFileSync(tmp, text, 'utf-8');
+    renameSync(tmp, targetPath);
+  } catch (err) {
+    try {
+      if (existsSync(tmp)) unlinkSync(tmp);
+    } catch {}
+    throw err;
+  }
 }
 
 function readState() {
@@ -374,7 +434,7 @@ function buildSnapshot(activeConvId) {
     if (!entry || typeof entry !== 'object') continue;
     if (['probe', 'selftest', 'None', 'unknown'].includes(cid)) continue;
     const nd = typeof entry.note_dir === 'string' ? entry.note_dir : '';
-    const wsName = nd.startsWith('~/agy-notes/') ? nd.slice('~/agy-notes/'.length).replace(/\/+$/, '') : cid.slice(0, 8);
+    const wsName = extractWsName(nd, cid);
     if (!byWs.has(wsName)) byWs.set(wsName, []);
     byWs.get(wsName).push({ cid, entry });
 
@@ -382,7 +442,7 @@ function buildSnapshot(activeConvId) {
     trackedSessions.push({
       convId: cid,
       convShort: cid.slice(0, 8),
-      noteDir: nd || `~/agy-notes/${cid.slice(0, 8)}`,
+      noteDir: nd || `${NOTE_ROOT_SHORT}/${cid.slice(0, 8)}`,
       health,
       dead: health.startsWith('DEAD'),
       deadReason: entry.dead_reason || '',
@@ -432,7 +492,7 @@ function buildSnapshot(activeConvId) {
 
       workspaces.push({
         name: ent.name,
-        shortPath: `~/agy-notes/${ent.name}`,
+        shortPath: toShortPath(wsDir),
         absPath: wsDir,
         fileCount: files.length,
         files,
@@ -451,7 +511,7 @@ function buildSnapshot(activeConvId) {
 
   return {
     activeConversationId: activeConvId || '',
-    noteRoot: toShortPath(NOTE_ROOT),
+    noteRoot: NOTE_ROOT_SHORT,
     dataDir: toShortPath(DATA_DIR),
     workspaces,
     trackedSessions,
@@ -501,7 +561,7 @@ app.api('/app.js', () => new RespClass(readFileSync(join(__dirname, 'app.js'), '
 jsonApi('/api/snapshot', (data) => {
   const conv = data?.conversationId || app.config?.conversationId || '';
   return buildSnapshot(conv);
-}, 'GET');
+}, 'POST');
 
 jsonApi('/api/file', (data) => {
   const wsName = data?.workspace || '';
@@ -527,7 +587,7 @@ jsonApi('/api/file', (data) => {
     size: st.size,
     updatedAtMs: Math.round(st.mtimeMs),
   };
-}, 'GET');
+}, 'POST');
 
 jsonApi('/api/workspace/init', (data) => {
   const name = String(data?.name || '').trim();
@@ -548,11 +608,12 @@ jsonApi('/api/workspace/init', (data) => {
     atomicWrite(statusPath, STATUS_TEMPLATE(name, nowText()));
   }
 
+  const shortPath = toShortPath(wsDir);
   return {
     ok: true,
     name,
-    shortPath: `~/agy-notes/${name}`,
-    launchPrompt: `/note-offload 读取 ~/agy-notes/${name}/task.md 与 status.md，执行下一未完成阶段并落盘汇报。`,
+    shortPath,
+    launchPrompt: `/note-offload 读取 ${shortPath}/task.md 与 status.md，执行下一未完成阶段并落盘汇报。`,
   };
 }, 'POST');
 

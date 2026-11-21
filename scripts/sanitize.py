@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """把注入给模型的文本过一遍替换：英文与对抗味词一律换中文中性说法。"""
+import os
 import re
 
 REPLACEMENTS = (
@@ -52,8 +53,25 @@ def clean(text):
 
 
 def latin_leftovers(text):
+    scrubbed = text or ""
+    env_root = os.environ.get("AGY_NOTE_ROOT") or ""
+    if env_root:
+        abs_root = os.path.abspath(os.path.expanduser(env_root)).rstrip("/")
+        home = os.path.abspath(os.path.expanduser("~")).rstrip("/")
+        roots = [abs_root]
+        if abs_root == home:
+            roots.append("~")
+        elif abs_root.startswith(home + os.sep):
+            roots.append("~" + abs_root[len(home):])
+        for root in sorted(set(roots), key=len, reverse=True):
+            if root:
+                scrubbed = re.sub(
+                    re.escape(root) + r"(?:/[A-Za-z0-9._-]+)?",
+                    "~/agy-notes/",
+                    scrubbed,
+                )
     # 剔除 ~/agy-notes/<workspace> 自定义目录名片段后再做残留词校验
-    scrubbed = _NOTE_PATH_RE.sub("~/agy-notes/", text or "")
+    scrubbed = _NOTE_PATH_RE.sub("~/agy-notes/", scrubbed)
     words = set(re.findall(r"[A-Za-z][A-Za-z0-9_.-]*", scrubbed))
     left = []
     for w in sorted(words):

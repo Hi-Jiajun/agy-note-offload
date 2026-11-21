@@ -70,22 +70,6 @@
     }
   }
 
-  async function apiGet(path) {
-    if (window.sidecar?.fetch) {
-      const res = await window.sidecar.fetch(path, { method: 'GET' });
-      const data = await res.json().catch(() => ({}));
-      if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);
-      return data;
-    }
-    const url = uiToken
-      ? `${path}${path.includes('?') ? '&' : '?'}token=${encodeURIComponent(uiToken)}`
-      : path;
-    const res = await fetch(url, { method: 'GET' });
-    const data = await res.json().catch(() => ({}));
-    if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);
-    return data;
-  }
-
   async function apiPost(path, body = {}) {
     if (window.sidecar?.fetch) {
       const res = await window.sidecar.fetch(path, {
@@ -184,7 +168,8 @@
   }
 
   function launchPromptFor(wsName) {
-    return `/note-offload 读取 ~/agy-notes/${wsName}/task.md 与 status.md，执行下一未完成阶段并落盘汇报。`;
+    const root = (state.snap?.noteRoot || '~/agy-notes').replace(/\/+$/, '');
+    return `/note-offload 读取 ${root}/${wsName}/task.md 与 status.md，执行下一未完成阶段并落盘汇报。`;
   }
 
   function renderWorkspaces() {
@@ -345,9 +330,7 @@
     state.selectedFile = fileName;
     renderDetailHeader();
     try {
-      const data = await apiGet(
-        `/api/file?workspace=${encodeURIComponent(wsName)}&file=${encodeURIComponent(fileName)}`
-      );
+      const data = await apiPost('/api/file', { workspace: wsName, file: fileName });
       state.fileMeta = data;
       $('current-file-path').textContent = data.shortPath;
 
@@ -498,8 +481,7 @@
   async function refreshAll(forceFile = false) {
     try {
       const conv = window.sidecar?.conversationId || '';
-      const q = conv ? `?conversationId=${encodeURIComponent(conv)}` : '';
-      state.snap = await apiGet(`/api/snapshot${q}`);
+      state.snap = await apiPost('/api/snapshot', conv ? { conversationId: conv } : {});
       $('live-dot').classList.remove('err');
       renderCurrentView(forceFile);
     } catch {

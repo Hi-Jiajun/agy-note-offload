@@ -37,13 +37,20 @@ case "${1:-}" in
   ""|-h|--help) usage; exit 1 ;;
   --list)
     [ -f "$MAP" ] || { echo "尚无别名表: $MAP（可用 neturl --set 初始化）" >&2; exit 1; }
-    grep -v '^\s*#' "$MAP" | cut -f1,3 | column -t -s $'\t'
+    awk -F'\t' '!/^[[:space:]]*#/ && NF>=2 {print $1 "\t" $3}' "$MAP" | column -t -s $'\t'
     exit 0 ;;
   --set)
     [ $# -ge 3 ] || { echo "用法: neturl --set 别名 真值 [备注]" >&2; exit 1; }
+    key="$2"; val="$3"; note="${4:-}"
+    if [[ ! "$key" =~ ^[A-Za-z0-9._-]{1,32}$ ]]; then
+      echo "别名非法（仅支持 1 到 32 位字母、数字、点、下划线或连字符）: $key" >&2; exit 1
+    fi
+    if [ -z "$val" ] || [[ "$val" == *$'\t'* ]] || [[ "$val" == *$'\n'* ]] || [[ "$val" == *$'\r'* ]]; then
+      echo "真值不能为空且不得包含换行或制表符" >&2; exit 1
+    fi
+    note=$(printf '%s' "$note" | tr '\t\r\n' '   ')
     ensure_map_for_write
-    key=$2; val=$3; note=${4:-}
-    if grep -qP "^$(printf '%s' "$key" | sed 's/[.[\*^$]/\\&/g')\t" "$MAP"; then
+    if awk -F'\t' -v k="$key" 'BEGIN{rc=1} !/^[[:space:]]*#/ && $1==k {rc=0; exit} END{exit rc}' "$MAP"; then
       echo "别名已存在: $key" >&2; exit 1
     fi
     printf '%s\t%s\t%s\n' "$key" "$val" "$note" >> "$MAP"
@@ -53,7 +60,7 @@ esac
 
 [ -f "$MAP" ] || { echo "尚无别名表: $MAP" >&2; exit 2; }
 key=$1; suffix=${2:-}
-val=$(grep -v '^\s*#' "$MAP" | awk -F'\t' -v k="$key" '$1==k{print $2; exit}')
+val=$(NETURL_KEY="$key" awk -F'\t' '!/^[[:space:]]*#/ && $1==ENVIRON["NETURL_KEY"] {print $2; exit}' "$MAP")
 if [ -z "$val" ]; then
   echo "未知别名: $key（用 neturl --list 看已有）" >&2
   exit 2

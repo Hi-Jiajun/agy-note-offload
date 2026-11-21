@@ -19,7 +19,7 @@ EXPECTED = "SessionStart"
 
 GUIDE = (
     "[落盘目录] 本会话的大段日志、长表格、反汇编或长清单优先写入 {dir}/"
-    "（若指定了专属 ~/agy-notes/<工作台>/ 则写该目录），"
+    "（若指定了专属 {root}/<工作台>/ 则写该目录），"
     "正文只给结论与路径；读大文件用 grep 定位加 sed 或 read_file 分片读取。"
 )
 
@@ -41,13 +41,18 @@ def main():
 
     conv = payload.get("conversationId") or ""
     if conv:
-        state = hooklib.load_state()
-        if conv in state:
-            state.pop(conv, None)
-            hooklib.save_state(state)
+        with hooklib.state_lock():
+            state = hooklib.load_state()
+            if conv in state:
+                state.pop(conv, None)
+                hooklib.save_state(state)
 
     hooklib.log("sessionstart conv=%s" % (conv or None))
-    msg = sanitize.clean(GUIDE).replace("{dir}", hooklib.resolve_note_dir(conv, create=False))
+    msg = (
+        sanitize.clean(GUIDE)
+        .replace("{root}", hooklib.note_root_display())
+        .replace("{dir}", hooklib.resolve_note_dir(conv, create=False))
+    )
     print(json.dumps({
         "injectSteps": [{"systemMessage": {"systemMessage": msg}}],
     }, ensure_ascii=False))

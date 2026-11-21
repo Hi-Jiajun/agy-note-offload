@@ -1,7 +1,11 @@
 # Runtime state & logs
 .filter-retry-state.json
 .filter-retry-state.json.tmp
+.filter-retry-state.json.tmp.*
+.filter-retry-state.lock
 hook-invocations.log
+hook-invocations.log.lock
+hook-invocations.log.tmp.*
 
 # User-specific alias mappings (keep net-map.tsv.example tracked)
 scripts/net-map.tsv

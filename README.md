@@ -85,6 +85,11 @@ neturl --list
 neturl --set gw-c https://api-c.example.com 示例服务
 ```
 
+### 环境变量
+
+- `AGY_NOTE_ROOT`：覆盖落盘工作台根目录（默认为 `~/agy-notes`），Hooks、`agynote` 与 Sidecar 统一读写该目录。
+- `AGY_OFFLOAD_DATA_DIR`：覆盖运行时状态、调用日志与 `net-map.tsv` 的数据目录（默认为 `~/.local/share/agy-note-offload`）。
+
 ## 与其他 Plugin / Skill / MCP 的兼容性
 
 - **`agy-powertools`**：同事件 Hook 按序合并执行，前者 `PreInvocation` 仅做只读遥测并返回 `{}`，与本插件完全互补；同时本插件可与会话分支功能搭配使用。

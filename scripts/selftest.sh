@@ -9,16 +9,18 @@ cd "$PLUGIN_ROOT" || exit 1
 PYTHON_BIN="$(command -v python3 || echo /usr/bin/python3)"
 TMP_BASE="${TMPDIR:-/tmp}"
 TEST_DATA_DIR=$(mktemp -d "$TMP_BASE/agy-selftest-data.XXXXXX")
+TEST_NOTE_ROOT=$(mktemp -d "$TMP_BASE/agy-selftest-notes.XXXXXX")
 export AGY_OFFLOAD_DATA_DIR="$TEST_DATA_DIR"
+export AGY_NOTE_ROOT="$TEST_NOTE_ROOT"
 
 fails=0
 pass() { echo "PASS  $1"; }
 fail() { echo "FAIL  $1"; fails=$((fails + 1)); }
+cleanup_path() { "$PYTHON_BIN" -c 'import shutil,sys;[shutil.rmtree(p,ignore_errors=True) for p in sys.argv[1:]]' "$@"; }
 
 T=$(mktemp "$TMP_BASE/selftest-transcript.XXXXXX.jsonl")
-TEST_CONV_DIR="$HOME/agy-notes/selftest"
-TEST_WS_DIR="$HOME/agy-notes/selftest-ws"
-rm -rf "$TEST_CONV_DIR" "$TEST_WS_DIR"
+TEST_CONV_DIR="$TEST_NOTE_ROOT/selftest"
+TEST_WS_DIR="$TEST_NOTE_ROOT/selftest-ws"
 
 reset_state() { rm -f "$TEST_DATA_DIR/.filter-retry-state.json"; }
 blocked() { printf '%s\n' "{\"step_index\":${1:-4},\"output_tokens\":90,\"input_tokens\":21000,\"cache_read_tokens\":0,\"thinking\":\"t\",\"content\":\"This request was blocked by Gemini's filters.\"}" > "$T"; }
@@ -33,6 +35,7 @@ allowed = {"name", "displayName", "version", "description", "author", "homepage"
 unknown = set(pj) - allowed
 assert not unknown, f"unknown plugin.json keys: {unknown}"
 assert pj.get("name") == "note-offload"
+assert pj.get("version") == "1.0.1", f"unexpected plugin version: {pj.get('version')}"
 assert pj.get("logo") and os.path.exists(pj["logo"])
 
 hj = json.load(open("hooks.json", encoding="utf-8"))
@@ -60,7 +63,8 @@ g_out=$(echo '{"conversationId":"selftest"}' | "$PYTHON_BIN" ./scripts/provider-
 [ ! -d "$TEST_CONV_DIR" ] && pass "SessionStart 惰性建目录（未产生 0 文件空文件夹）" || fail "SessionStart 提前建了空目录"
 "$PYTHON_BIN" -c "import json,os;p=os.environ['AGY_OFFLOAD_DATA_DIR']+'/.filter-retry-state.json';assert not os.path.exists(p) or 'selftest' not in json.load(open(p))" 2>/dev/null \
   && pass "SessionStart 自动清零同会话旧状态" || fail "SessionStart 未清旧状态"
-echo "$g_out" | grep -q 'agy-notes/selftest' && ! echo "$g_out" | grep -q '{dir}' \
+EXPECTED_CONV_DIR=$("$PYTHON_BIN" -c "import sys;sys.path.insert(0,'./scripts');import hooklib;print(hooklib.resolve_note_dir('selftest',create=False))")
+echo "$g_out" | grep -qF "$EXPECTED_CONV_DIR" && ! echo "$g_out" | grep -q '{dir}' && ! echo "$g_out" | grep -q '{root}' \
   && pass "SessionStart 正确替换目标目录" || fail "SessionStart 输出异常: $g_out"
 
 # 4) 注入给模型的文案去毒与全中文化检验
@@ -117,7 +121,7 @@ call >/dev/null
 out_ws_card=$(echo '{"conversationId":"selftest","initialNumSteps":10,"lastUserInput":"继续"}' | "$PYTHON_BIN" ./scripts/provider-filter-notice.py)
 echo "$out_ws_card" | grep -q 'selftest-ws/turn-99.md' \
   && pass "熔断卡片准确引用命名工作台最新笔记" || fail "熔断卡片未引用命名工作台: $out_ws_card"
-rm -rf "$TEST_WS_DIR" "$TEST_CONV_DIR"
+cleanup_path "$TEST_WS_DIR" "$TEST_CONV_DIR"
 
 # 6) Orchestrator / Plan Mode 识别：禁要求 write_file，引导精简 exit_plan_mode
 reset_state
@@ -200,13 +204,13 @@ blocked_zero 5; out_z=$(call)
 out_note=$(printf '# 测试任务\n' | ./scripts/agynote init selftest-ws - && ./scripts/agynote show selftest-ws)
 echo "$out_note" | grep -q 'task.md' && echo "$out_note" | grep -q '进度看板' \
   && pass "agynote init/show 正常" || fail "agynote init/show 异常"
-mkdir -p "$HOME/agy-notes/selftest-empty-dir"
+mkdir -p "$TEST_NOTE_ROOT/selftest-empty-dir"
 out_st=$(./scripts/agynote status)
 echo "$out_st" | grep -q 'selftest-ws' && pass "agynote status 健康看板输出正常" || fail "agynote status 异常: $out_st"
 out_cl=$(./scripts/agynote clean)
-[ ! -d "$HOME/agy-notes/selftest-empty-dir" ] && [ -d "$TEST_WS_DIR" ] \
+[ ! -d "$TEST_NOTE_ROOT/selftest-empty-dir" ] && [ -d "$TEST_WS_DIR" ] \
   && pass "agynote clean 只清 0 文件空目录、保留有效目录" || fail "agynote clean 异常: $out_cl"
-rm -rf "$TEST_WS_DIR" "$TEST_CONV_DIR"
+cleanup_path "$TEST_WS_DIR" "$TEST_CONV_DIR"
 
 out_net=$(./scripts/neturl --set gw-test https://api-test.example.com test && ./scripts/neturl gw-test /v1/ping)
 echo "$out_net" | grep -q 'https://api-test.example.com/v1/ping' && pass "neturl 读写隔离 DATA_DIR 正常" || fail "neturl 异常: $out_net"
@@ -240,6 +244,8 @@ after=$(stat -c%s "$TEST_DATA_DIR/hook-invocations.log" 2>/dev/null || stat -f%z
 NODE_BIN="$(command -v node || true)"
 if "$PYTHON_BIN" - <<'PY'
 import json, os
+pj = json.load(open("sidecars/board/package.json", encoding="utf-8"))
+assert pj.get("version") == "1.0.1", f"unexpected sidecar package version: {pj.get('version')}"
 sj = json.load(open("sidecars/board/sidecar.json", encoding="utf-8"))
 assert sj.get("has_web_ui") is True
 views = (sj.get("ui_config") or {}).get("views") or []
@@ -247,24 +253,24 @@ assert any(v.get("entrypoint") == "SIDECAR_UI_ENTRYPOINT_AUX_PANE" for v in view
 for f in ("package.json", "main.mjs", "index.html", "styles.css", "app.js"):
     assert os.path.exists(os.path.join("sidecars/board", f))
 PY
-then pass "sidecar.json 与 Aux Pane 前端资产完整"; else fail "sidecar.json 元数据或资产缺失"; fi
+then pass "sidecar.json、版本与 Aux Pane 前端资产完整"; else fail "sidecar.json 元数据或资产缺失"; fi
 
 if [ -n "$NODE_BIN" ] && "$NODE_BIN" --check ./sidecars/board/main.mjs ./sidecars/board/app.js 2>/dev/null; then
   pass "Sidecar JS 语法检查通过"
 
-  TEST_NOTE_ROOT=$(mktemp -d "$TMP_BASE/selftest-noteroot.XXXXXX")
+  TEST_SC_NOTE_ROOT=$(mktemp -d "$TMP_BASE/selftest-scnotes.XXXXXX")
   TEST_SC_DATA=$(mktemp -d "$TMP_BASE/selftest-scdata.XXXXXX")
   SC_PORT=$("$PYTHON_BIN" -c "import socket;s=socket.socket();s.bind(('127.0.0.1',0));print(s.getsockname()[1]);s.close()")
   SC_TOKEN="selftest-token-123"
 
-  AGY_NOTE_ROOT="$TEST_NOTE_ROOT" \
+  AGY_NOTE_ROOT="$TEST_SC_NOTE_ROOT" \
   AGY_OFFLOAD_DATA_DIR="$TEST_SC_DATA" \
   ANTIGRAVITY_SIDECAR_WEB_PORT="$SC_PORT" \
   ANTIGRAVITY_SIDECAR_UI_TOKEN="$SC_TOKEN" \
   "$NODE_BIN" ./sidecars/board/main.mjs >/dev/null 2>&1 &
   SC_PID=$!
 
-  if "$PYTHON_BIN" - "$SC_PORT" "$SC_TOKEN" "$TEST_NOTE_ROOT" "$TEST_SC_DATA" <<'PY'
+  if "$PYTHON_BIN" - "$SC_PORT" "$SC_TOKEN" "$TEST_SC_NOTE_ROOT" "$TEST_SC_DATA" <<'PY'
 import json, os, sys, time, urllib.error, urllib.request
 
 port, token, note_root, data_dir = sys.argv[1:5]
@@ -277,7 +283,7 @@ def req(method, path, body=None, use_token=True):
     data = None
     if body is not None:
         headers["Content-Type"] = "application/json"
-        data = json.dumps(body).encode("utf-8")
+        data = body.encode("utf-8") if isinstance(body, str) else json.dumps(body).encode("utf-8")
     r = urllib.request.Request(base + path, data=data, headers=headers, method=method)
     try:
         with urllib.request.urlopen(r, timeout=3) as resp:
@@ -297,24 +303,36 @@ for _ in range(30):
         time.sleep(0.1)
 assert ready, "sidecar did not start in time"
 
-# 1. 无 token POST 必须返回 401
+# 1. 无 token POST 必须返回 401，GET 敏感端点不得泄露数据，静态页保持开放
 st, _ = req("POST", "/api/workspace/init", {"name": "ws1"}, use_token=False)
-assert st == 401, f"expected 401 without token, got {st}"
+assert st == 401, f"expected 401 without token on POST init, got {st}"
+st, _ = req("POST", "/api/snapshot", {}, use_token=False)
+assert st == 401, f"expected 401 without token on POST /api/snapshot, got {st}"
+st, _ = req("POST", "/api/file", {"workspace": "ws1", "file": "task.md"}, use_token=False)
+assert st == 401, f"expected 401 without token on POST /api/file, got {st}"
+st, _ = req("GET", "/api/snapshot", use_token=False)
+assert st in (401, 405), f"expected 401/405 on GET /api/snapshot, got {st}"
+st, _ = req("GET", "/styles.css", use_token=False)
+assert st == 200, f"expected 200 on /styles.css, got {st}"
+st, _ = req("GET", "/app.js", use_token=False)
+assert st == 200, f"expected 200 on /app.js, got {st}"
+st, _ = req("POST", "/api/workspace/init", "{bad json", use_token=True)
+assert st in (400, 500), f"expected 400/500 on invalid JSON, got {st}"
 
 # 2. 初始化工作台 + 在线保存 task.md + 快照与文件读取
 st, raw = req("POST", "/api/workspace/init", {"name": "ws1", "taskContent": "# T1\nhello\n"})
 assert st == 200 and json.loads(raw)["ok"] is True
 st, raw = req("POST", "/api/workspace/save", {"workspace": "ws1", "file": "task.md", "content": "# T1 updated\n"})
 assert st == 200 and json.loads(raw)["ok"] is True
-st, raw = req("GET", "/api/file?workspace=ws1&file=task.md")
+st, raw = req("POST", "/api/file", {"workspace": "ws1", "file": "task.md"})
 assert st == 200 and json.loads(raw)["content"] == "# T1 updated\n"
 
 # 3. 禁止覆写非 task/status 文件 + 路径穿越拦截
 open(os.path.join(note_root, "ws1", "turn-1.md"), "w").write("frozen")
 st, _ = req("POST", "/api/workspace/save", {"workspace": "ws1", "file": "turn-1.md", "content": "hack"})
 assert st == 403, f"expected 403 for turn-1 write, got {st}"
-st, _ = req("GET", "/api/file?workspace=../etc&file=passwd")
-assert st in (400, 403), f"path traversal not blocked: {st}"
+st, _ = req("POST", "/api/file", {"workspace": "../etc", "file": "passwd"})
+assert st in (400, 403, 500), f"path traversal not blocked: {st}"
 
 # 4. 别名增删 + 状态重置 + snapshot 检验
 st, raw = req("POST", "/api/alias/upsert", {"key": "gw-z", "value": "https://api-z.example.com", "note": "test"})
@@ -324,12 +342,12 @@ assert st == 200 and not any(a["key"] == "gw-z" for a in json.loads(raw)["aliase
 
 json.dump({"deadconv1234": {"tries": 3, "dead": True, "dead_reason": "max_retry", "ts": time.time()}},
           open(os.path.join(data_dir, ".filter-retry-state.json"), "w"))
-st, raw = req("GET", "/api/snapshot")
+st, raw = req("POST", "/api/snapshot", {})
 snap = json.loads(raw)
 assert len(snap["workspaces"]) == 1 and snap["trackedSessions"][0]["dead"] is True
 st, _ = req("POST", "/api/state/reset", {"conversationId": "deadconv1234"})
 assert st == 200
-st, raw = req("GET", "/api/snapshot")
+st, raw = req("POST", "/api/snapshot", {})
 assert json.loads(raw)["trackedSessions"][0]["dead"] is False
 
 # 5. 清理空目录
@@ -337,18 +355,146 @@ os.makedirs(os.path.join(note_root, "empty-ws"), exist_ok=True)
 st, raw = req("POST", "/api/workspace/clean", {})
 assert st == 200 and json.loads(raw)["removedCount"] == 1
 PY
-  then pass "Sidecar 侧边栏后端端到端 HTTP 鉴权、读写、熔断重置与防穿越全通过"
+  then pass "Sidecar 侧边栏后端端到端 HTTP 鉴权（含 snapshot/file）、读写、熔断重置与防穿越全通过"
   else fail "Sidecar HTTP 端到端自检失败"
   fi
 
   kill "$SC_PID" 2>/dev/null || true
   wait "$SC_PID" 2>/dev/null || true
-  rm -rf "$TEST_NOTE_ROOT" "$TEST_SC_DATA"
+  cleanup_path "$TEST_SC_NOTE_ROOT" "$TEST_SC_DATA"
 else
   fail "Sidecar JS 语法检查失败或缺少 node"
 fi
 
-rm -rf "$TEST_DATA_DIR" "$T"
+# 13) /note-offload 精准触发负例与正例
+reset_state
+if "$PYTHON_BIN" - <<'PY'
+import json, os, subprocess, sys
+
+state_file = os.path.join(os.environ["AGY_OFFLOAD_DATA_DIR"], ".filter-retry-state.json")
+negatives = [
+    "请查看 skills/note-offload/SKILL.md 与 ~/.gemini/config/plugins/note-offload/",
+    "请不要直接调用 `/note-offload` 命令",
+    "示例：\n```bash\n/note-offload 读取任务\n```",
+    "/note-offload-extra 测试参数",
+]
+for msg in negatives:
+    payload = json.dumps({"conversationId": "selftest", "lastUserInput": msg}, ensure_ascii=False)
+    out = subprocess.check_output([sys.executable, "./scripts/provider-filter-notice.py"], input=payload, text=True).strip()
+    assert out == "{}", f"negative triggered: {msg!r} -> {out}"
+    if os.path.exists(state_file):
+        st = json.load(open(state_file, encoding="utf-8"))
+        assert not (st.get("selftest") or {}).get("offload_mode"), f"offload_mode set on negative: {msg!r}"
+
+pos_payload = json.dumps({"conversationId": "selftest", "lastUserInput": "/note-offload 执行下一步"}, ensure_ascii=False)
+pos_out = subprocess.check_output([sys.executable, "./scripts/provider-filter-notice.py"], input=pos_payload, text=True)
+assert "[落盘模式]" in pos_out, f"positive did not trigger: {pos_out}"
+st = json.load(open(state_file, encoding="utf-8"))
+assert (st.get("selftest") or {}).get("offload_mode") is True
+PY
+then pass "/note-offload 精准触发：路径/代码段/后缀负例不误判，独立词正例正常触发"; else fail "/note-offload 精准触发回归失败"; fi
+
+# 14) 静默工作台绑定：不强开落盘但保留 Stop 2 档工作台指向
+reset_state
+out_silent=$(echo '{"conversationId":"selftest","lastUserInput":"请检查 ~/agy-notes/selftest-ws/status.md 的进度"}' | "$PYTHON_BIN" ./scripts/provider-filter-notice.py)
+if [ "$out_silent" = "{}" ] && "$PYTHON_BIN" - <<'PY'
+import json, os
+st = json.load(open(os.path.join(os.environ["AGY_OFFLOAD_DATA_DIR"], ".filter-retry-state.json"), encoding="utf-8"))
+entry = st.get("selftest") or {}
+assert entry.get("note_dir", "").endswith("/selftest-ws"), f"missing note_dir: {entry}"
+assert not entry.get("offload_mode"), f"unexpected offload_mode: {entry}"
+PY
+then
+  printf '%s\n' '{"step_index":4,"output_tokens":1200,"input_tokens":5000,"content":"This request was blocked by Gemini'"'"'s filters."}' > "$T"
+  out_s_stop=$(call)
+  echo "$out_s_stop" | grep -q 'selftest-ws/turn-4.md' \
+    && pass "仅提及工作台路径时静默绑定不强开落盘，Stop 2 档仍准确落盘到该工作台" \
+    || fail "静默绑定后 Stop 落盘路径错误: $out_s_stop"
+  cleanup_path "$TEST_WS_DIR"
+else
+  fail "静默工作台绑定失败: $out_silent"
+fi
+
+# 15) 多进程并发写入 state 锁压测
+reset_state
+if "$PYTHON_BIN" - <<'PY'
+import glob, json, os, subprocess, sys
+
+procs = []
+for i in range(12):
+    payload = json.dumps({
+        "conversationId": f"conc-{i}",
+        "lastUserInput": f"/note-offload 并发任务 {i}",
+    }, ensure_ascii=False)
+    p = subprocess.Popen(
+        [sys.executable, "./scripts/provider-filter-notice.py"],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    procs.append((i, p, payload))
+
+for i, p, payload in procs:
+    out, err = p.communicate(payload, timeout=10)
+    assert p.returncode == 0, f"proc {i} failed: {err}"
+    assert "[落盘模式]" in out, f"proc {i} missing offload rule: {out}"
+
+data_dir = os.environ["AGY_OFFLOAD_DATA_DIR"]
+st = json.load(open(os.path.join(data_dir, ".filter-retry-state.json"), encoding="utf-8"))
+for i in range(12):
+    assert f"conc-{i}" in st, f"lost state key conc-{i}: {list(st)}"
+leftover_tmps = glob.glob(os.path.join(data_dir, ".filter-retry-state.json.tmp.*"))
+assert not leftover_tmps, f"leftover temp files: {leftover_tmps}"
+PY
+then pass "12 进程并发写入 state 无丢更新、JSON 完整且无临时文件残留"; else fail "多进程并发写压测失败"; fi
+
+# 16) is_plan_mode 长尾窗（>40 步）回归
+reset_state
+"$PYTHON_BIN" - "$T" <<'PY'
+import json, sys
+rows = [{"step_index": 1, "type": "SYSTEM_MESSAGE", "content": "Plan mode is on: this turn runs on the planning model."}]
+for i in range(2, 57):
+    rows.append({"step_index": i, "type": "PLANNER_RESPONSE", "model": "gemini-4-carbon-high", "content": f"step {i}"})
+rows.append({
+    "step_index": 57,
+    "type": "PLANNER_RESPONSE",
+    "model": "gemini-4-carbon-high",
+    "output_tokens": 500,
+    "content": "This request was blocked by Gemini's filters.",
+})
+with open(sys.argv[1], "w", encoding="utf-8") as fh:
+    for r in rows:
+        fh.write(json.dumps(r, ensure_ascii=False) + "\n")
+PY
+out_long_pm=$(call)
+echo "$out_long_pm" | grep -q '\[规划精简\]' && echo "$out_long_pm" | grep -q 'exit_plan_mode' \
+  && pass "is_plan_mode 长尾窗（>40 步）仍准确命中规划精简分流" || fail "长尾窗 Plan Mode 识别失效: $out_long_pm"
+
+# 17) agysum 损坏行容错 + neturl 无 grep -P 精确查重
+BAD_SUM=$(mktemp "$TMP_BASE/selftest-badsum.XXXXXX.jsonl")
+printf '%s\n' '{"step_index":1,"type":"USER_INPUT","content":"<USER_REQUEST> 查一下 </USER_REQUEST>"}' \
+  '{broken json' \
+  '123' \
+  '{"step_index":3,"type":"PLANNER_RESPONSE","content":"答案正文2"}' > "$BAD_SUM"
+out_bad_sum=$(./scripts/agysum "$BAD_SUM" --width 40)
+rm -f "$BAD_SUM"
+echo "$out_bad_sum" | grep -q 'M3: 答案正文2' && echo "$out_bad_sum" | grep -q '跳过 2 行损坏记录' \
+  && pass "agysum 损坏行容错并附注跳过行数" || fail "agysum 损坏行容错异常: $out_bad_sum"
+
+if ./scripts/neturl --set gw.test https://dot.example.com dot >/dev/null \
+  && ./scripts/neturl --set gwXtest https://x.example.com x >/dev/null \
+  && ! ./scripts/neturl --set gw.test https://dup.example.com dup >/dev/null 2>&1 \
+  && ! ./scripts/neturl --set 'bad/key' https://bad.example.com bad >/dev/null 2>&1 \
+  && [ "$(./scripts/neturl gw.test /ok)" = "https://dot.example.com/ok" ] \
+  && [ "$(./scripts/neturl gwXtest /ok)" = "https://x.example.com/ok" ]; then
+  pass "neturl 无 grep -P 精确字面量查重与 key 校验正常"
+else
+  fail "neturl 精确查重或校验异常"
+fi
+
+rm -f "$T"
+cleanup_path "$TEST_DATA_DIR" "$TEST_NOTE_ROOT"
 
 echo "----"
 if [ "$fails" -eq 0 ]; then echo "ALL PASS"; else echo "$fails 项失败"; exit 1; fi
