@@ -12,3 +12,6 @@ __pycache__/
 *.pyc
 backup-*/
 .DS_Store
+
+# Local agent workspace state (never commit)
+.agents/
