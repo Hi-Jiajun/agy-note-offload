@@ -1,0 +1,67 @@
+#!/usr/bin/env python3
+"""把 Antigravity 的 transcript.jsonl 压成要点，接续旧会话时用它代替整份转储。
+
+原始转储里有大量 <USER_REQUEST> 标签、结构化清单和代码串，整份倒进上下文是主要触发面；
+这里只留角色、步号、压平后的前 N 字，默认 120 字、只看最后 40 步。
+
+用法：
+  agysum <transcript.jsonl> [--tail 40] [--width 120] [--full]
+  agysum <会话ID>            # 自动定位到该会话的 transcript
+"""
+import json
+import pathlib
+import sys
+
+BRAIN = pathlib.Path.home() / ".gemini/antigravity/brain"
+
+
+def resolve(arg):
+    p = pathlib.Path(arg)
+    if p.exists():
+        return p
+    cand = BRAIN / arg / ".system_generated/logs/transcript.jsonl"
+    if cand.exists():
+        return cand
+    # 允许只给 ID 前缀
+    for d in sorted(BRAIN.glob(arg + "*")):
+        c = d / ".system_generated/logs/transcript.jsonl"
+        if c.exists():
+            return c
+    sys.exit(f"找不到 transcript: {arg}")
+
+
+def flat(text, width):
+    out = " ".join((text or "").split())
+    out = out.replace("<USER_REQUEST>", "").replace("</USER_REQUEST>", "")
+    return out if len(out) <= width else out[:width] + "…"
+
+
+def main():
+    args = [a for a in sys.argv[1:] if not a.startswith("--")]
+    if not args:
+        sys.exit(__doc__)
+    tail, width, full = 40, 120, "--full" in sys.argv
+    for i, a in enumerate(sys.argv):
+        if a == "--tail":
+            tail = int(sys.argv[i + 1])
+        if a == "--width":
+            width = int(sys.argv[i + 1])
+
+    path = resolve(args[0])
+    rows = [json.loads(l) for l in path.read_text(encoding="utf-8").splitlines() if l.strip()]
+    picked = rows if full else rows[-tail:]
+    blocked = sum(1 for r in rows if "blocked by Gemini" in (r.get("content") or ""))
+    print(f"# {path}\n# 共 {len(rows)} 步，其中被拦 {blocked} 次；下面取 {'全部' if full else f'最后 {len(picked)} 步'}")
+    for r in picked:
+        c = r.get("content") or ""
+        if "blocked by Gemini" in c:
+            c = "[被拦]"
+        kind = r.get("type") or ""
+        who = "U" if kind == "USER_INPUT" else ("S" if kind.startswith("SYSTEM") else "M")
+        if who == "S":
+            continue
+        print(f"{who}{r.get('step_index')}: {flat(c, width)}")
+
+
+if __name__ == "__main__":
+    main()

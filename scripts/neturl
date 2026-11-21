@@ -1,0 +1,32 @@
+#!/usr/bin/env bash
+# 上游脱敏别名解析器：正文只写别名，真值从 net-map.tsv 取，别把完整域名写进正文。
+#   neturl gw-a                    打印真值
+#   neturl gw-a /v1/das/devices    打印拼接后的完整地址
+#   neturl --set gw-c https://h/p  追加一条
+#   neturl --list                  列出全部别名
+set -uo pipefail
+MAP="$(cd "$(dirname "$0")" && pwd)/net-map.tsv"
+
+usage() { sed -n '3,6p' "$0" | sed 's/^# \{0,1\}//'; }
+
+case "${1:-}" in
+  ""|-h|--help) usage; exit 1 ;;
+  --list) grep -v '^\s*#' "$MAP" | cut -f1,3 | column -t -s $'\t'; exit 0 ;;
+  --set)
+    [ $# -ge 3 ] || { echo "用法: neturl --set 别名 真值 [备注]" >&2; exit 1; }
+    key=$2; val=$3; note=${4:-}
+    if grep -qP "^$(printf '%s' "$key" | sed 's/[.[\*^$]/\\&/g')\t" "$MAP"; then
+      echo "别名已存在: $key" >&2; exit 1
+    fi
+    printf '%s\t%s\t%s\n' "$key" "$val" "$note" >> "$MAP"
+    echo "已追加 $key"
+    exit 0 ;;
+esac
+
+key=$1; suffix=${2:-}
+val=$(grep -v '^\s*#' "$MAP" | awk -F'\t' -v k="$key" '$1==k{print $2; exit}')
+if [ -z "$val" ]; then
+  echo "未知别名: $key（用 neturl --list 看已有）" >&2
+  exit 2
+fi
+printf '%s%s\n' "$val" "$suffix"

@@ -1,0 +1,14 @@
+# Runtime state & logs
+.filter-retry-state.json
+.filter-retry-state.json.tmp
+hook-invocations.log
+
+# User-specific alias mappings (keep net-map.tsv.example tracked)
+scripts/net-map.tsv
+net-map.tsv
+
+# Python bytecode & local backups
+__pycache__/
+*.pyc
+backup-*/
+.DS_Store
