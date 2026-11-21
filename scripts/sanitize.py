@@ -32,13 +32,15 @@ KEEP = (
     "neturl", "net-map.tsv", "https", "http", "md", "hook",
     "decision", "continue", "reason", "injectSteps", "systemMessage",
     "metadata", "user_markdown", "terminationBehavior", "terminate", "note-offload",
-    "write_file", "run_command", "agynote", "task.md", "status.md",
+    "write_file", "run_command", "exit_plan_mode", "agynote", "task.md", "status.md",
+    "local", "share", "bin", "agy-note-offload",
     "config", "scripts", "gemini", "gw-", "v1", "v2",
     "agy-notes", "turn-", "read_file", "offset", "limit", "misc", "agysum", "transcript",
     "cat", "grep", "sed", "tail", "width", "n",
 )
 
 _COMPILED = tuple((re.compile(p, re.IGNORECASE if p.isascii() else 0), r) for p, r in REPLACEMENTS)
+_NOTE_PATH_RE = re.compile(r"~/agy-notes/[A-Za-z0-9._-]+")
 
 
 def clean(text):
@@ -50,7 +52,9 @@ def clean(text):
 
 
 def latin_leftovers(text):
-    words = set(re.findall(r"[A-Za-z][A-Za-z0-9_.-]*", text or ""))
+    # 剔除 ~/agy-notes/<workspace> 自定义目录名片段后再做残留词校验
+    scrubbed = _NOTE_PATH_RE.sub("~/agy-notes/", text or "")
+    words = set(re.findall(r"[A-Za-z][A-Za-z0-9_.-]*", scrubbed))
     left = []
     for w in sorted(words):
         if any(w.startswith(k) for k in KEEP):

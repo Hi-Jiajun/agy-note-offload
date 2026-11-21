@@ -1,28 +1,46 @@
 #!/usr/bin/env python3
-"""Antigravity 钩子共用工具：自轮转日志、带 TTL 的状态文件与落盘笔记目录管理。
+"""Antigravity 钩子共用工具：数据目录隔离、工作台绑定、惰性目录与状态管理。
 
-设计目标是把维护压到零：
-  * 日志超过 MAX_LOG_BYTES 就只保留最后 KEEP_LINES 行，不需要外部 logrotate；
-  * 状态文件只记最近 TTL_SECONDS 内还在用的会话，过期条目自动丢弃；
-  * 所有写入失败都静默，钩子绝不因为磁盘问题阻断 agent。
+目录与隔离原则：
+  * 运行时日志、状态文件与 net-map.tsv 统一存放在 DATA_DIR（默认为
+    ~/.local/share/agy-note-offload，支持 AGY_OFFLOAD_DATA_DIR 覆盖），
+    避免污染插件目录或 git 工作树。
+  * resolve_note_dir 默认惰性（create=False），仅在真正写笔记时创建目录，
+    彻底杜绝普通问答产生大量空文件夹。
 """
+import hashlib
 import json
 import os
+import re
 import time
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-LOG_PATH = os.path.join(SCRIPT_DIR, "hook-invocations.log")
-STATE_PATH = os.path.join(SCRIPT_DIR, ".filter-retry-state.json")
+DATA_DIR = os.path.expanduser(
+    os.environ.get("AGY_OFFLOAD_DATA_DIR") or "~/.local/share/agy-note-offload"
+)
+LOG_PATH = os.path.join(DATA_DIR, "hook-invocations.log")
+STATE_PATH = os.path.join(DATA_DIR, ".filter-retry-state.json")
 
 MAX_LOG_BYTES = 200_000
 KEEP_LINES = 300
 TTL_SECONDS = 7 * 24 * 3600
 NOTE_ROOT = os.path.join(os.path.expanduser("~"), "agy-notes")
 
+_NOTE_DIR_RE = re.compile(r"(?:~|/[^\s\"'`<>]+)?/agy-notes/([A-Za-z0-9][A-Za-z0-9._-]{0,63})")
+_PLACEHOLDERS = {"name", "task", "work", "dir", "conv", "conv8", "session", "workspace", "example"}
+
+
+def _ensure_data_dir():
+    try:
+        os.makedirs(DATA_DIR, exist_ok=True)
+    except OSError:
+        pass
+
 
 def log(line):
     """追加一行调用日志，超限先就地轮转。"""
     try:
+        _ensure_data_dir()
         if os.path.exists(LOG_PATH) and os.path.getsize(LOG_PATH) > MAX_LOG_BYTES:
             with open(LOG_PATH, encoding="utf-8", errors="replace") as fh:
                 tail = fh.read().splitlines()[-KEEP_LINES:]
@@ -50,6 +68,8 @@ def load_state():
             raw = json.load(fh)
     except (OSError, ValueError):
         return {}
+    if not isinstance(raw, dict):
+        return {}
     now = time.time()
     return {
         conv: entry
@@ -60,6 +80,7 @@ def load_state():
 
 def save_state(state):
     try:
+        _ensure_data_dir()
         tmp = STATE_PATH + ".tmp"
         with open(tmp, "w", encoding="utf-8") as fh:
             json.dump(state, fh)
@@ -68,14 +89,32 @@ def save_state(state):
         pass
 
 
-def _note_abs_dir(conv):
+def extract_note_dir(text):
+    """从文本中提取显式指定的命名工作台路径（~/agy-notes/<name>）。"""
+    if not text:
+        return ""
+    for match in _NOTE_DIR_RE.finditer(text):
+        name = match.group(1).rstrip(".")
+        if not name or name.lower() in _PLACEHOLDERS:
+            continue
+        return f"~/agy-notes/{name}"
+    return ""
+
+
+def _to_abs_note_dir(conv, entry=None):
+    if isinstance(entry, dict):
+        nd = entry.get("note_dir") or ""
+        if isinstance(nd, str) and nd.startswith("~/agy-notes/"):
+            rel = nd[len("~/agy-notes/"):].strip("/")
+            if rel and "/" not in rel and ".." not in rel:
+                return os.path.join(NOTE_ROOT, rel)
     key = (conv or "misc")[:8]
     return os.path.join(NOTE_ROOT, key)
 
 
-def note_dir(conv, create=True):
-    """给会话一个固定的落盘笔记目录，默认顺手建出来。"""
-    path = _note_abs_dir(conv)
+def resolve_note_dir(conv, entry=None, create=False):
+    """解析本会话目标落盘目录（优先绑定的命名工作台，否则回退 <conv8>），默认惰性不建目录。"""
+    path = _to_abs_note_dir(conv, entry)
     if create:
         try:
             os.makedirs(path, exist_ok=True)
@@ -85,27 +124,43 @@ def note_dir(conv, create=True):
     return "~" + path[len(home):] if path.startswith(home) else path
 
 
-def latest_note(conv):
-    """返回该会话落盘目录下最新修改的 .md 文件（~/ 缩写路径）；没有则返回空串。"""
-    path = _note_abs_dir(conv)
+def note_dir(conv, create=False):
+    """兼容旧调用入口的轻量包装。"""
+    return resolve_note_dir(conv, None, create=create)
+
+
+def latest_note(conv, entry=None):
+    """在绑定的落盘目录中查找最新输出笔记（优先 turn-*.md，其次 status.md，跳过 task.md）。"""
+    path = _to_abs_note_dir(conv, entry)
     if not os.path.isdir(path):
         return ""
-    best_mtime = -1.0
-    best_path = ""
+
+    best_turn = (-1.0, "")
+    status_path = ""
     try:
         for name in os.listdir(path):
-            if not name.endswith(".md"):
-                continue
             full = os.path.join(path, name)
             if not os.path.isfile(full):
                 continue
-            mtime = os.path.getmtime(full)
-            if mtime > best_mtime:
-                best_mtime = mtime
-                best_path = full
+            if name.startswith("turn-") and name.endswith(".md"):
+                mtime = os.path.getmtime(full)
+                if mtime > best_turn[0]:
+                    best_turn = (mtime, full)
+            elif name == "status.md":
+                status_path = full
     except OSError:
         return ""
-    if not best_path:
+
+    picked = best_turn[1] or status_path
+    if not picked:
         return ""
     home = os.path.expanduser("~")
-    return "~" + best_path[len(home):] if best_path.startswith(home) else best_path
+    return "~" + picked[len(home):] if picked.startswith(home) else picked
+
+
+def input_sig(text):
+    """将用户输入规整后生成 12 位指纹，用于识别原样重发。"""
+    norm = " ".join((text or "").split())
+    if not norm:
+        return ""
+    return hashlib.sha1(norm.encode("utf-8")).hexdigest()[:12]

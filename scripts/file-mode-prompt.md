@@ -1,9 +1,9 @@
 # 落盘模式（note-offload）首句参考
 
-> 本规范已封装为全局技能 `~/.gemini/config/skills/note-offload/SKILL.md`。
+> 本规范已封装为原生插件 `~/.gemini/config/plugins/note-offload/`（技能 `note-offload`）。
 > 日常新开会话时，直接一句即可激活，无需复制长模板：
 >
-> `用 note-offload 落盘模式接续 <任务一句话>，只做一件事：<具体动作>`
+> `/note-offload 读取 ~/agy-notes/<工作台名>/task.md 与 status.md，执行下一未完成阶段并落盘汇报。`
 
 默认会话仍为普通模式。仅在需要大输出、长日志/反汇编分析，或旧会话连续受限后接续时启用**落盘模式**。
 
