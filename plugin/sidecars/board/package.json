@@ -1,0 +1,7 @@
+{
+  "name": "note-offload-board",
+  "version": "2.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Note Offload auxiliary pane sidecar for Antigravity"
+}

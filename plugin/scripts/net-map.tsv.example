@@ -1,0 +1,9 @@
+# 上游脱敏别名表（示例）：正文与笔记只写短别名，真值留在本机 net-map.tsv（不随插件包提交）。
+# 格式：别名<TAB>真值<TAB>备注
+# 用 neturl 取真值： node <插件目录>/scripts/neturl.mjs gw-a
+# 用 neturl 拼路径： node <插件目录>/scripts/neturl.mjs gw-a /v1/health
+# 用 neturl 追加：   node <插件目录>/scripts/neturl.mjs --set gw-c https://api-c.example.com 备注
+
+gw-a	https://api-a.example.com	示例远端网关 A
+gw-b	https://api-b.example.com	示例远端网关 B
+lan-1	192.0.2.10	示例内网测试主机（RFC 5737 文档保留地址）

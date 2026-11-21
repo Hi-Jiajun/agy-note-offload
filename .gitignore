@@ -1,17 +1,18 @@
 # Runtime state & logs
 .filter-retry-state.json
-.filter-retry-state.json.tmp
-.filter-retry-state.json.tmp.*
+.filter-retry-state.json.tmp*
 .filter-retry-state.lock
 hook-invocations.log
 hook-invocations.log.lock
-hook-invocations.log.tmp.*
+hook-invocations.log.tmp*
 
 # User-specific alias mappings (keep net-map.tsv.example tracked)
-scripts/net-map.tsv
 net-map.tsv
+net-map.tsv.lock
 
-# Python bytecode & local backups
+# Release artifacts, dependencies & local backups
+dist/
+node_modules/
 __pycache__/
 *.pyc
 backup-*/

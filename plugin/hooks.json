@@ -1,0 +1,29 @@
+{
+  "note-offload-guardrail": {
+    "SessionStart": [
+      {
+        "type": "command",
+        "command": "node ./scripts/hook-guardrail.mjs",
+        "timeout": 10
+      }
+    ]
+  },
+  "note-offload-retry": {
+    "Stop": [
+      {
+        "type": "command",
+        "command": "node ./scripts/hook-retry.mjs",
+        "timeout": 10
+      }
+    ]
+  },
+  "note-offload-notice": {
+    "PreInvocation": [
+      {
+        "type": "command",
+        "command": "node ./scripts/hook-notice.mjs",
+        "timeout": 5
+      }
+    ]
+  }
+}
