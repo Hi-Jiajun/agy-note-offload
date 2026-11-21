@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""Antigravity SessionStart hook: 仅做落盘目录准备，零日常回复干扰。
+"""Antigravity SessionStart hook: 预建落盘目录并清理同会话残留状态（含撤回重发场景）。
 
 原则：
-  * 只在新会话开头注入 1 条极简约定：大块产出优先写入 ~/agy-notes/<会话前8位>/；
-  * 不设 400 字上限，不提任何审核/替换/重试类元描述，保持平时原生体验；
-  * 顺手创建好落盘目录，为随时切入落盘模式或启用 note-offload 做好准备。
+  * 只在新会话开头（或撤回重发触发 SessionStart 时）注入 1 条极简落盘目录约定；
+  * 若状态文件中存在同 conversationId 的旧熔断/重试记录（例如用户撤回重跑），立即清零；
+  * 不设 400 字上限，不提任何审核/替换/重试类元描述，保持平时原生体验。
 """
 import json
 import os
@@ -38,6 +38,12 @@ def main():
         return
 
     conv = payload.get("conversationId") or ""
+    if conv:
+        state = hooklib.load_state()
+        if conv in state:
+            state.pop(conv, None)
+            hooklib.save_state(state)
+
     hooklib.log("sessionstart conv=%s" % (conv or None))
     msg = sanitize.clean(GUIDE).replace("{dir}", hooklib.note_dir(conv))
     print(json.dumps({

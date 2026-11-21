@@ -7,7 +7,6 @@ cd "$(dirname "$0")" || exit 1
 PYTHON_BIN="$(command -v python3 || echo /usr/bin/python3)"
 CONFIG_DIR="${AGY_CONFIG_DIR:-$HOME/.gemini/config}"
 
-# 自动判断在仓库目录运行还是在已安装目录运行
 if [ -f "../hooks.json.example" ] && [ -f "../skills/note-offload/SKILL.md" ]; then
   HOOKS_FILE="../hooks.json.example"
   SKILL_FILE="../skills/note-offload/SKILL.md"
@@ -39,8 +38,8 @@ fi
 T=$(mktemp "$TMP_BASE/selftest.XXXXXX.jsonl")
 TEST_NOTE_DIR="$HOME/agy-notes/selftest"
 reset_state() { rm -f .filter-retry-state.json; }
-blocked() { printf '%s\n' '{"step_index":4,"output_tokens":90,"input_tokens":21000,"cache_read_tokens":0,"thinking":"t","content":"This request was blocked by Gemini'"'"'s filters."}' > "$T"; }
-blocked_zero() { printf '%s\n' '{"step_index":4,"content":"This request was blocked by Gemini'"'"'s filters."}' > "$T"; }
+blocked() { printf '%s\n' "{\"step_index\":${1:-4},\"output_tokens\":90,\"input_tokens\":21000,\"cache_read_tokens\":0,\"thinking\":\"t\",\"content\":\"This request was blocked by Gemini's filters.\"}" > "$T"; }
+blocked_zero() { printf '%s\n' "{\"step_index\":${1:-4},\"content\":\"This request was blocked by Gemini's filters.\"}" > "$T"; }
 call() { echo "{\"transcriptPath\":\"$T\",\"conversationId\":\"selftest\"}" | "$PYTHON_BIN" ./provider-filter-retry.py; }
 
 # 1) hooks 配置合法、事件受支持且本套件 3 个脚本存在
@@ -80,9 +79,13 @@ then pass "脚本编译通过"; else fail "脚本编译失败"; fi
 
 # 3) 注入给模型的文案：零敏感词、零元描述、全中文化、正确替换目录
 reset_state
-blocked
+blocked 4
 g_out=$(echo '{"conversationId":"selftest"}' | "$PYTHON_BIN" ./provider-filter-guardrail.py)
-r1_out=$(call); r2_out=$(call)
+r1_out=$(call)
+blocked 5
+r2_out=$(call)
+# 第一轮续跑消费掉 defer_alias，第二轮正式补注 OFFLOAD_RULE
+echo '{"conversationId":"selftest","lastUserInput":"执行下一步分析"}' | "$PYTHON_BIN" ./provider-filter-notice.py >/dev/null
 n_alias=$(echo '{"conversationId":"selftest","lastUserInput":"执行下一步分析"}' | "$PYTHON_BIN" ./provider-filter-notice.py)
 
 if "$PYTHON_BIN" - "$g_out" "$r1_out" "$r2_out" "$n_alias" <<'PY'
@@ -115,6 +118,8 @@ then pass "模型注入文案零敏感词、零元描述且全中文化"; else f
 
 echo "$g_out" | grep -q 'agy-notes/selftest' && ! echo "$g_out" | grep -q '{dir}' \
   && pass "SessionStart 极简落盘目录正确替换" || fail "SessionStart 输出异常: $g_out"
+echo "$r2_out" | grep -q 'write_file' && echo "$r2_out" | grep -q 'run_command' \
+  && pass "2 档落盘指令限定只调 write_file 禁止新跑命令" || fail "2 档落盘指令未限定工具: $r2_out"
 
 # 4) 正常回合放行并清除重试/熔断状态（保留 alias_injected）
 reset_state
@@ -122,43 +127,61 @@ reset_state
 printf '%s\n' '{"step_index":5,"content":"hello"}' > "$T"
 out=$(call)
 [ "$out" = "{}" ] && pass "正常回合放行" || fail "正常回合被误判: $out"
-"$PYTHON_BIN" -c "import json;e=json.load(open('.filter-retry-state.json'))['selftest'];assert e.get('alias_injected') and 'tries' not in e and 'dead' not in e and 'offload_mode' not in e" 2>/dev/null \
+"$PYTHON_BIN" -c "import json;e=json.load(open('.filter-retry-state.json'))['selftest'];assert e.get('alias_injected') and 'tries' not in e and 'dead' not in e" 2>/dev/null \
   && pass "正常回合清除重试与熔断态但保留 alias_injected" || fail "正常回合状态清理异常"
 
 # 5) 2 档无痕分级：新会话(21k)首拦重述 → 二拦切落盘 → 三拦直接停机标 dead
 reset_state
-blocked
+blocked 4
 out=$(call)
 echo "$out" | grep -q '"decision": "continue"' && echo "$out" | grep -q '\[重写\]' \
   && pass "小上下文首拦走 1 档无痕重述" || fail "1 档异常: $out"
+blocked 5
 out=$(call)
 echo "$out" | grep -q '"decision": "continue"' && echo "$out" | grep -q '\[落盘\]' \
   && pass "二拦切 2 档无痕落盘" || fail "2 档异常: $out"
+blocked 6
 out=$(call)
 [ "$out" = "{}" ] && pass "超过 2 档上限直接停机（不再硬跑第 3 轮）" || fail "2 档上限失效: $out"
 "$PYTHON_BIN" -c "import json;e=json.load(open('.filter-retry-state.json'))['selftest'];assert e.get('dead') and e.get('dead_reason')=='max_retry'" 2>/dev/null \
   && pass "超上限正确标 dead(max_retry)" || fail "超上限状态错误"
 
-# 5b) 总上下文判定：input=2400 + cache=150000 直接切落盘，并立刻联动 PreInvocation
+# 5b) 总上下文判定 + 错峰补注（当轮续跑不叠注，下一轮正常调用再补注）
 reset_state
 printf '%s\n' '{"step_index":4,"output_tokens":90,"input_tokens":2400,"cache_read_tokens":150000,"thinking":"t","content":"This request was blocked by Gemini'"'"'s filters."}' > "$T"
 out=$(call)
 echo "$out" | grep -q '\[落盘\]' && pass "大缓存总上下文首拦直切落盘模式" || fail "大缓存未识别为大上下文: $out"
-out=$(echo '{"conversationId":"selftest","lastUserInput":"继续排查驱动日志"}' | "$PYTHON_BIN" ./provider-filter-notice.py)
-echo "$out" | grep -q '\[落盘模式\]' && echo "$out" | grep -q 'agy-notes/selftest' \
-  && pass "首轮直切落盘立即联动 PreInvocation 补充规则" || fail "首轮直切未联动 PreInvocation: $out"
+out_same_turn=$(echo '{"conversationId":"selftest"}' | "$PYTHON_BIN" ./provider-filter-notice.py)
+[ "$out_same_turn" = "{}" ] && pass "当轮自动续跑跳过叠注（防双消息二次秒拒）" || fail "当轮续跑仍叠注: $out_same_turn"
+out_next_turn=$(echo '{"conversationId":"selftest","lastUserInput":"继续排查驱动日志"}' | "$PYTHON_BIN" ./provider-filter-notice.py)
+echo "$out_next_turn" | grep -q '\[落盘模式\]' && echo "$out_next_turn" | grep -q 'agy-notes/selftest' \
+  && pass "下一轮正常调用错峰补注持续落盘规则" || fail "错峰补注失败: $out_next_turn"
 
-# 5c) 长回答直切落盘
-reset_state
-printf '%s\n' '{"step_index":4,"output_tokens":3031,"input_tokens":5000,"content":"This request was blocked by Gemini'"'"'s filters."}' > "$T"
-out=$(call)
-echo "$out" | grep -q '\[落盘\]' && pass "长回答首拦直切落盘模式" || fail "长回答未直切落盘: $out"
+# 5c) 撤回重发（Undo / Rewind）三层清理：SessionStart、PreInvocation(initialNumSteps)、Stop(step回退)
+# Case A: SessionStart 清空旧 dead 状态
+"$PYTHON_BIN" -c "import json,time;json.dump({'selftest':{'step':98,'tries':3,'dead':True,'ts':time.time()}},open('.filter-retry-state.json','w'))"
+echo '{"conversationId":"selftest"}' | "$PYTHON_BIN" ./provider-filter-guardrail.py >/dev/null
+"$PYTHON_BIN" -c "import json,os;assert not os.path.exists('.filter-retry-state.json') or 'selftest' not in json.load(open('.filter-retry-state.json'))" 2>/dev/null \
+  && pass "SessionStart 重触发自动清零旧 dead 状态" || fail "SessionStart 未清旧状态"
+
+# Case B: PreInvocation 识别 initialNumSteps <= prev_step 撤回重发
+"$PYTHON_BIN" -c "import json,time;json.dump({'selftest':{'step':98,'tries':3,'dead':True,'ts':time.time()}},open('.filter-retry-state.json','w'))"
+out_rw=$(echo '{"conversationId":"selftest","initialNumSteps":29,"lastUserInput":"继续"}' | "$PYTHON_BIN" ./provider-filter-notice.py)
+[ "$out_rw" = "{}" ] && pass "PreInvocation 识别撤回回退并放行（不误拦/不误弹卡片）" || fail "PreInvocation 撤回未清状态: $out_rw"
+
+# Case C: Stop 识别 step_index < prev_step 撤回后新分支首次被拦正常续跑（撤回回退场景）
+"$PYTHON_BIN" -c "import json,time;json.dump({'selftest':{'step':98,'tries':3,'dead':True,'ts':time.time()}},open('.filter-retry-state.json','w'))"
+printf '%s\n' '{"step_index":64,"output_tokens":1213,"input_tokens":13022,"cache_read_tokens":254073,"thinking":"t","content":"This request was blocked by Gemini'"'"'s filters."}' > "$T"
+out_rw_stop=$(call)
+echo "$out_rw_stop" | grep -q '"decision": "continue"' && echo "$out_rw_stop" | grep -q '\[落盘\]' \
+  && pass "Stop 识别撤回后新分支首拦正常触发续跑（不再误判 tries=4）" || fail "Stop 撤回分支仍误判停机: $out_rw_stop"
 
 # 5d) 连续 2 次零输出预检拦截立即熔断（context_locked）
 reset_state
-blocked_zero
+blocked_zero 4
 out=$(call)
 echo "$out" | grep -q '\[重写\]' && pass "首次零输出允许尝试 1 次" || fail "首次零输出处理异常: $out"
+blocked_zero 5
 out=$(call)
 [ "$out" = "{}" ] && pass "连续 2 次零输出立即熔断停机" || fail "连续零输出未熔断: $out"
 "$PYTHON_BIN" -c "import json;e=json.load(open('.filter-retry-state.json'))['selftest'];assert e.get('dead') and e.get('dead_reason')=='context_locked'" 2>/dev/null \
@@ -167,15 +190,15 @@ out=$(call)
 # 6) PreInvocation 熔断智能防空转 + 断点就绪卡片（含最新落盘文件）
 mkdir -p "$TEST_NOTE_DIR"
 printf '# test\n' > "$TEST_NOTE_DIR/turn-99.md"
-out=$(echo '{"conversationId":"selftest","lastUserInput":"继续"}' | "$PYTHON_BIN" ./provider-filter-notice.py)
+out=$(echo '{"conversationId":"selftest","initialNumSteps":10,"lastUserInput":"继续"}' | "$PYTHON_BIN" ./provider-filter-notice.py)
 if echo "$out" | "$PYTHON_BIN" -c 'import json,sys; d=json.load(sys.stdin); s=d["injectSteps"][0]["systemMessage"]; md=s["metadata"]["user_markdown"]; assert d.get("terminationBehavior")=="terminate" and s["systemMessage"]=="" and "turn-99.md" in md and "note-offload" in md and "selftest" in md' 2>/dev/null
 then pass "熔断后发「继续」触发防空转 terminate + 断点就绪卡片（含最新笔记）"; else fail "防空转输出异常: $out"; fi
 
 "$PYTHON_BIN" -c "import json;d=json.load(open('.filter-retry-state.json'));d['selftest']['notified']=False;json.dump(d,open('.filter-retry-state.json','w'))"
-out=$(echo '{"conversationId":"selftest","lastUserInput":"改查本地 Makefile 的编译选项"}' | "$PYTHON_BIN" ./provider-filter-notice.py)
+out=$(echo '{"conversationId":"selftest","initialNumSteps":10,"lastUserInput":"改查本地 Makefile 的编译选项"}' | "$PYTHON_BIN" ./provider-filter-notice.py)
 if echo "$out" | "$PYTHON_BIN" -c 'import json,sys; d=json.load(sys.stdin); s=d["injectSteps"][0]["systemMessage"]; assert "terminationBehavior" not in d and s["systemMessage"]=="" and "user_markdown" in s["metadata"]' 2>/dev/null
 then pass "熔断后发具体新指令不阻断，仅弹一次断点卡片"; else fail "具体新指令被误拦或未提示: $out"; fi
-out2=$(echo '{"conversationId":"selftest","lastUserInput":"再检查一下头文件引用"}' | "$PYTHON_BIN" ./provider-filter-notice.py)
+out2=$(echo '{"conversationId":"selftest","initialNumSteps":11,"lastUserInput":"再检查一下头文件引用"}' | "$PYTHON_BIN" ./provider-filter-notice.py)
 [ "$out2" = "{}" ] && pass "同窗口再次发具体新指令不重复刷屏" || fail "熔断卡片重复刷屏: $out2"
 rm -f "$TEST_NOTE_DIR/turn-99.md"
 
@@ -189,28 +212,32 @@ json.dump({'step_index': 5, 'content': body}, open(sys.argv[1], 'w'), ensure_asc
 out=$(call)
 [ "$out" = "{}" ] && pass "长正文引用原文不误判" || fail "长正文被误判: $out"
 
-reset_state; blocked
+reset_state; blocked 10
 "$PYTHON_BIN" -c "import json,time;json.dump({'selftest':{'step':4,'tries':3,'zero_streak':2,'dead':True,'ts':time.time()-3600}},open('.filter-retry-state.json','w'))"
 out=$(call); echo "$out" | grep -q '\[重写\]' && pass "窗口过期后重置到 1 档" || fail "窗口过期未重置: $out"
 
-# 8) PreInvocation：普通模式不注入，落盘模式注入一次且不重复
-reset_state; blocked
+# 8) PreInvocation：普通模式不注入，落盘模式错峰注入一次且不重复
+reset_state; blocked 4
 call >/dev/null
 out=$(echo '{"conversationId":"selftest","lastUserInput":"继续分析"}' | "$PYTHON_BIN" ./provider-filter-notice.py)
 [ "$out" = "{}" ] && pass "普通模式不注入落盘规则" || fail "普通模式误注入: $out"
+blocked 5
 call >/dev/null
+# 第 1 次续跑消费 defer_alias
+echo '{"conversationId":"selftest"}' | "$PYTHON_BIN" ./provider-filter-notice.py >/dev/null
+# 下一轮正常调用注入持续规则
 out=$(echo '{"conversationId":"selftest","lastUserInput":"继续分析"}' | "$PYTHON_BIN" ./provider-filter-notice.py)
-echo "$out" | grep -q 'agy-notes/selftest' && pass "落盘模式注入一次持续规则" || fail "未注入持续规则: $out"
+echo "$out" | grep -q 'agy-notes/selftest' && pass "落盘模式错峰注入一次持续规则" || fail "未注入持续规则: $out"
 out=$(echo '{"conversationId":"selftest","lastUserInput":"继续分析"}' | "$PYTHON_BIN" ./provider-filter-notice.py)
 [ "$out" = "{}" ] && pass "持续规则不重复注入" || fail "规则重复注入: $out"
 
 # 9) 容错：USER_CANCELED、非法 stdin、事件错投
-reset_state; blocked
+reset_state; blocked 4
 out=$(echo "{\"transcriptPath\":\"$T\",\"conversationId\":\"selftest\",\"terminationReason\":\"USER_CANCELED\"}" | "$PYTHON_BIN" ./provider-filter-retry.py)
 [ "$out" = "{}" ] && pass "USER_CANCELED 放行" || fail "取消仍续跑: $out"
 out=$(echo 'not json' | "$PYTHON_BIN" ./provider-filter-retry.py)
 [ "$out" = "{}" ] && pass "非法 stdin 放行" || fail "非法 stdin 崩了"
-reset_state; blocked
+reset_state; blocked 4
 out=$(echo "{\"transcriptPath\":\"$T\",\"conversationId\":\"selftest\",\"hookEventName\":\"PreInvocation\"}" | "$PYTHON_BIN" ./provider-filter-retry.py)
 [ "$out" = "{}" ] && pass "错投事件不误发" || fail "错投事件仍续跑: $out"
 out=$(echo "{\"transcriptPath\":\"$T\",\"conversationId\":\"selftest\",\"hookEventName\":\"Stop\"}" | "$PYTHON_BIN" ./provider-filter-retry.py)
@@ -221,12 +248,25 @@ if "$PYTHON_BIN" - "$SKILL_FILE" <<'PY'
 import os, sys
 txt = open(sys.argv[1], encoding="utf-8").read()
 assert txt.startswith("---\n") and "name: note-offload\n" in txt and "description:" in txt
+assert "阶段即落盘" in txt and "stdout" in txt
 for banned in ("安全过滤器", "绕开", "攻防", "bypass", "exploit", "fake password"):
     assert banned not in txt.lower(), f"banned term in skill: {banned}"
-for script in ("agysum", "neturl"):
+for script in ("agysum", "neturl", "agynote"):
     assert os.path.exists(os.path.join(".", script))
 PY
-then pass "note-offload Skill 格式、去毒与脚本引用均正常"; else fail "note-offload Skill 检查失败"; fi
+then pass "note-offload Skill 格式、阶段落盘纪律与脚本引用均正常"; else fail "note-offload Skill 检查失败"; fi
+
+# 10b) 用户首句显式发 /note-offload 时，PreInvocation 在首轮推理前即注入双向落盘纪律
+reset_state
+out_exp=$(echo '{"conversationId":"selftest","lastUserInput":"/note-offload 读取 task.md 执行"}' | "$PYTHON_BIN" ./provider-filter-notice.py)
+echo "$out_exp" | grep -q 'status.md' && echo "$out_exp" | grep -q '不输出过渡文字' \
+  && pass "显式 /note-offload 首轮立即注入静默工具链与双向落盘规则" || fail "显式 /note-offload 未立即生效: $out_exp"
+
+# 10c) agynote 双向工作台初始化与查看
+out_note=$(printf '# 测试任务\n' | ./agynote init selftest - && ./agynote show selftest)
+echo "$out_note" | grep -q 'task.md' && echo "$out_note" | grep -q '进度看板' \
+  && pass "agynote 双向工作台（task.md/status.md）正常" || fail "agynote 异常: $out_note"
+rm -rf "$TEST_NOTE_DIR"
 
 # 11) agysum 只出要点、剥标签、带拦截统计
 SUM=$(mktemp "$TMP_BASE/selftest.XXXXXX.jsonl")
@@ -239,7 +279,7 @@ echo "$out" | grep -q '<USER_REQUEST>' && fail "agysum 未剥标签" || pass "ag
 echo "$out" | grep -q '被拦 1 次' && pass "agysum 统计拦截" || fail "agysum 未统计"
 rm -f "$SUM"
 
-# 12) 日志轮转（全新环境下显式写入超限行并验证截断）
+# 12) 日志轮转
 "$PYTHON_BIN" -c "open('hook-invocations.log','a',encoding='utf-8').write(('y'*40+'\n')*20)"
 before=$(stat -c%s hook-invocations.log 2>/dev/null || stat -f%z hook-invocations.log 2>/dev/null || echo 0)
 "$PYTHON_BIN" -c "import sys;sys.path.insert(0,'.');import hooklib;hooklib.MAX_LOG_BYTES=1;hooklib.KEEP_LINES=5;hooklib.log('rotation-probe')"

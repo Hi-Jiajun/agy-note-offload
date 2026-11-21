@@ -42,6 +42,7 @@ for f in \
   provider-filter-notice.py \
   hooklib.py \
   sanitize.py \
+  agynote \
   agysum \
   neturl \
   file-mode-prompt.md \

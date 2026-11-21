@@ -43,6 +43,7 @@ agy-note-offload/
 │   ├── provider-filter-guardrail.py   # SessionStart hook
 │   ├── provider-filter-retry.py       # Stop hook
 │   ├── provider-filter-notice.py      # PreInvocation hook
+│   ├── agynote                        # 双向文件工作台管理（task.md ↔ status.md / turn-N.md）
 │   ├── agysum                         # 旧会话 transcript.jsonl 极简要点摘要工具
 │   ├── neturl                         # 远端地址别名查询 / 追加工具
 │   ├── net-map.tsv.example            # 脱敏示例别名表（本机真实表放在 ~/.gemini/config/scripts/net-map.tsv）
@@ -73,14 +74,24 @@ bash install.sh
 bash uninstall.sh
 ```
 
-## 日常用法
+## 日常用法（双向文件工作台）
 
-- **普通任务**：无需任何额外操作；偶发拦截或大上下文时由 Hook 自动分级兜底。
-- **主动启用落盘模式 / 接续旧会话**：新开会话直接说一句（无需手动复制模板）：
-  ```text
-  用 note-offload 落盘模式接续会话 <旧会话ID前8位>，只做一件事：<下一步动作>
+- **1. 初始化双向任务工作台（长需求放文件，聊天框只发短指令）**：
+  ```bash
+  # 创建 ~/agy-notes/my-task/{task.md,status.md}（可直接管道喂入任务文档）
+  ~/.gemini/config/scripts/agynote init my-task ./spec.md
   ```
-- **手动摘要旧会话**：
+  随后在聊天框只需发送 1 行短句：
+  ```text
+  /note-offload 读取 ~/agy-notes/my-task/task.md 与 status.md，执行下一未完成阶段并落盘汇报。
+  ```
+  模型会在执行过程中直接更新 `status.md` 与 `turn-N.md`（中间工具链静默，脚本大输出直写文件不刷终端），收尾仅回 1 行指针；切换模型、撤回重跑或新开会话时直接读同一目录无损接力。
+- **2. 查看工作台进度**：
+  ```bash
+  ~/.gemini/config/scripts/agynote ls
+  ~/.gemini/config/scripts/agynote show my-task
+  ```
+- **3. 手动摘要旧会话**：
   ```bash
   ~/.gemini/config/scripts/agysum <会话ID或前缀> --tail 40 --width 120
   ```

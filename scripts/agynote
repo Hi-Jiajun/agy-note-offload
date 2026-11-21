@@ -1,0 +1,126 @@
+#!/usr/bin/env python3
+"""agynote: 双向文件工作台管理小工具（task.md 输入 ↔ status.md / turn-N.md 输出）。
+
+用法：
+  agynote init <工作台名> [任务文件路径 | -]   创建 ~/agy-notes/<工作台名>/{task.md,status.md} 并打印一行启动短句
+  agynote show <工作台名或前缀>                查看当前 status.md 与笔记列表
+  agynote ls                                  列出最近更新的工作台目录
+"""
+import os
+import sys
+import time
+from pathlib import Path
+
+NOTE_ROOT = Path.home() / "agy-notes"
+
+TASK_TEMPLATE = """# 任务单（{name}）
+
+## 目标
+- 在此填写本阶段唯一工程目标与验收判据。
+
+## 待办阶段
+- [ ] 阶段 1：
+- [ ] 阶段 2：
+
+## 约束与参考路径
+- 参考文件：
+- 注意事项：脚本大输出请直接写文件，不要直接刷终端。
+"""
+
+STATUS_TEMPLATE = """# 进度看板（{name}）
+
+- 更新时间：{now}
+- 当前状态：待启动
+- 最新详稿：暂无
+
+## 阶段进展
+- 尚未开始执行，请读取同目录 `task.md` 推进第一项未完成阶段。
+"""
+
+
+def resolve_ws(prefix):
+    exact = NOTE_ROOT / prefix
+    if exact.is_dir():
+        return exact
+    matches = sorted(
+        [p for p in NOTE_ROOT.glob(f"{prefix}*") if p.is_dir()],
+        key=lambda p: p.stat().st_mtime,
+        reverse=True,
+    )
+    if matches:
+        return matches[0]
+    sys.exit(f"未找到工作台目录: {NOTE_ROOT / prefix}")
+
+
+def cmd_init(args):
+    if not args:
+        sys.exit("用法: agynote init <工作台名> [任务文件路径 | -]")
+    name = args[0].strip("/")
+    ws = NOTE_ROOT / name
+    ws.mkdir(parents=True, exist_ok=True)
+    task_file = ws / "task.md"
+    status_file = ws / "status.md"
+    now = time.strftime("%F %T")
+
+    if len(args) >= 2:
+        src = args[1]
+        content = sys.stdin.read() if src == "-" else Path(src).expanduser().read_text(encoding="utf-8")
+        task_file.write_text(content, encoding="utf-8")
+    elif not task_file.exists():
+        task_file.write_text(TASK_TEMPLATE.format(name=name), encoding="utf-8")
+
+    if not status_file.exists():
+        status_file.write_text(STATUS_TEMPLATE.format(name=name, now=now), encoding="utf-8")
+
+    short_ws = f"~/agy-notes/{name}"
+    print(f"已就绪: {short_ws}/ (task.md, status.md)")
+    print("复制到聊天框直接发送：")
+    print(f"/note-offload 读取 {short_ws}/task.md 与 status.md，执行下一未完成阶段并落盘汇报。")
+
+
+def cmd_show(args):
+    if not args:
+        sys.exit("用法: agynote show <工作台名或前缀>")
+    ws = resolve_ws(args[0])
+    print(f"=== 工作台: ~/agy-notes/{ws.name} ===")
+    status_file = ws / "status.md"
+    if status_file.exists():
+        print(status_file.read_text(encoding="utf-8").rstrip())
+    turns = sorted(ws.glob("turn-*.md"), key=lambda p: p.stat().st_mtime)
+    if turns:
+        print("\n=== 已落盘详稿 ===")
+        for t in turns[-10:]:
+            print(f"- ~/agy-notes/{ws.name}/{t.name} ({t.stat().st_size} B)")
+
+
+def cmd_ls():
+    if not NOTE_ROOT.is_dir():
+        print("~/agy-notes 尚无目录")
+        return
+    dirs = sorted(
+        [p for p in NOTE_ROOT.iterdir() if p.is_dir()],
+        key=lambda p: p.stat().st_mtime,
+        reverse=True,
+    )
+    for d in dirs[:15]:
+        mds = list(d.glob("*.md"))
+        ts = time.strftime("%m-%d %H:%M", time.localtime(d.stat().st_mtime))
+        has_task = "task" if (d / "task.md").exists() else "-"
+        print(f"{d.name:<18} {ts}  files={len(mds):<3} [{has_task}]")
+
+
+def main():
+    cmd = sys.argv[1] if len(sys.argv) > 1 else "ls"
+    rest = sys.argv[2:]
+    if cmd == "init":
+        cmd_init(rest)
+    elif cmd == "show":
+        cmd_show(rest)
+    elif cmd in ("ls", "list"):
+        cmd_ls()
+    else:
+        sys.exit(__doc__.strip())
+
+
+if __name__ == "__main__":
+    main()

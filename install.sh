@@ -20,6 +20,7 @@ for f in \
   provider-filter-guardrail.py \
   provider-filter-retry.py \
   provider-filter-notice.py \
+  agynote \
   agysum \
   neturl \
   file-mode-prompt.md \
@@ -32,6 +33,7 @@ chmod +x \
   "$SCRIPTS_DIR/provider-filter-guardrail.py" \
   "$SCRIPTS_DIR/provider-filter-retry.py" \
   "$SCRIPTS_DIR/provider-filter-notice.py" \
+  "$SCRIPTS_DIR/agynote" \
   "$SCRIPTS_DIR/agysum" \
   "$SCRIPTS_DIR/neturl" \
   "$SCRIPTS_DIR/selftest.sh"
