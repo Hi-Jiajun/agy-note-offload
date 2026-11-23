@@ -80,18 +80,23 @@ export function atomicWriteSync(targetPath, content) {
 }
 
 /**
- * 基于排他锁文件的同步跨进程互斥执行，支持死进程残留自动回收与 token 归属校验释放。
+ * 基于排他锁文件的同步跨进程互斥执行，支持死进程残留自动回收、token 归属校验释放、超时告警与严格模式。
  * @template T
  * @param {string} lockPath
  * @param {() => T} fn
- * @param {{ timeoutMs?: number, staleMs?: number }} [options]
+ * @param {{ timeoutMs?: number, staleMs?: number, strict?: boolean, onTimeout?: (info: { lockPath: string, timeoutMs: number, staleMs: number, strict: boolean, reason: string }) => void }} [options]
  * @returns {T}
  */
-export function withFileLockSync(lockPath, fn, { timeoutMs = 5000, staleMs = 15000 } = {}) {
+export function withFileLockSync(
+  lockPath,
+  fn,
+  { timeoutMs = 5000, staleMs = 15000, strict = false, onTimeout = null } = {},
+) {
   mkdirSync(dirname(lockPath), { recursive: true });
   const token = `${process.pid}-${randomBytes(6).toString('hex')}`;
   const deadline = Date.now() + timeoutMs;
   let acquired = false;
+  let failReason = '';
 
   while (true) {
     let fd = -1;
@@ -103,6 +108,7 @@ export function withFileLockSync(lockPath, fn, { timeoutMs = 5000, staleMs = 150
       break;
     } catch (err) {
       if (err?.code !== 'EEXIST') {
+        failReason = err?.code || 'OPEN_ERR';
         break;
       }
       if (isLockStale(lockPath, staleMs)) {
@@ -114,6 +120,7 @@ export function withFileLockSync(lockPath, fn, { timeoutMs = 5000, staleMs = 150
         }
       }
       if (Date.now() >= deadline) {
+        failReason = 'TIMEOUT';
         break;
       }
       sleepMs(8 + Math.floor(Math.random() * 10));
@@ -125,6 +132,21 @@ export function withFileLockSync(lockPath, fn, { timeoutMs = 5000, staleMs = 150
           // 忽略关闭异常
         }
       }
+    }
+  }
+
+  if (!acquired) {
+    if (typeof onTimeout === 'function') {
+      try {
+        onTimeout({ lockPath, timeoutMs, staleMs, strict, reason: failReason || 'TIMEOUT' });
+      } catch {
+        // 忽略超时回调函数内部异常
+      }
+    }
+    if (strict) {
+      const err = new Error(`获取文件锁超时 (${timeoutMs}ms, reason=${failReason || 'TIMEOUT'})`);
+      err.code = 'ELOCKTIMEOUT';
+      throw err;
     }
   }
 

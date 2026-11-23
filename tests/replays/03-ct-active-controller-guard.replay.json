@@ -1,0 +1,8 @@
+{
+  "id": "03-ct-active-controller-guard",
+  "title": "control-tower 现役总控免静默误绑且不产生 skip_ct_controller 刷屏日志",
+  "incident": "线上 48h hook-invocations.log 中 64% (868/1361) 行均为 preinvocation skip_ct_controller 刷屏",
+  "kind": "ct_controller_guard",
+  "controllerConvId": "aa11bb22-1111-2222-3333-444455556666",
+  "userInput": "核查 ~/agy-notes/worker-subtask/status.md 并更新调度总账"
+}

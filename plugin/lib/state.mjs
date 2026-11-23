@@ -1,5 +1,6 @@
 import { appendFileSync, existsSync, readFileSync, statSync } from 'node:fs';
 import { atomicWriteSync, withFileLockSync } from './lock.mjs';
+import { appendFlightEvent } from './logger.mjs';
 import {
   ensureDataDir,
   getLogLockPath,
@@ -31,9 +32,24 @@ function formatLogTimestamp(date = new Date()) {
  * @param {NodeJS.ProcessEnv} [env]
  * @returns {T}
  */
-export function withStateLock(fn, env = process.env) {
+export function withStateLock(fn, env = process.env, options = {}) {
   ensureDataDir(env);
-  return withFileLockSync(getStateLockPath(env), fn);
+  return withFileLockSync(getStateLockPath(env), fn, {
+    ...options,
+    onTimeout(info) {
+      appendFlightEvent(env, {
+        level: 'warn',
+        source: 'state',
+        event: 'lock_timeout',
+        ok: false,
+        message: `状态锁获取超时 (${info.timeoutMs}ms, reason=${info.reason})`,
+        detail: { lock: 'state', timeoutMs: info.timeoutMs, strict: info.strict },
+      });
+      if (typeof options.onTimeout === 'function') {
+        options.onTimeout(info);
+      }
+    },
+  });
 }
 
 /**
@@ -78,8 +94,14 @@ export function saveState(state, env = process.env) {
   ensureDataDir(env);
   try {
     atomicWriteSync(getStatePath(env), JSON.stringify(state));
-  } catch {
-    // 忽略磁盘写入异常以保持钩子非阻塞
+  } catch (err) {
+    appendFlightEvent(env, {
+      level: 'error',
+      source: 'state',
+      event: 'state_write_error',
+      ok: false,
+      message: err?.message || '状态文件写入失败',
+    });
   }
 }
 
@@ -186,9 +208,27 @@ export function appendLog(line, env = process.env, { maxBytes = MAX_LOG_BYTES, k
         atomicWriteSync(logPath, tail.length ? `${tail.join('\n')}\n` : '');
       }
       appendFileSync(logPath, `${formatLogTimestamp()} ${line}\n`, 'utf-8');
-    } catch {
-      // 忽略日志写异常
+    } catch (err) {
+      appendFlightEvent(env, {
+        level: 'error',
+        source: 'state',
+        event: 'log_write_error',
+        ok: false,
+        message: err?.message || '调用日志写入失败',
+      });
     }
+  }, {
+    timeoutMs: 1500,
+    onTimeout(info) {
+      appendFlightEvent(env, {
+        level: 'warn',
+        source: 'state',
+        event: 'lock_timeout',
+        ok: false,
+        message: `日志锁获取超时 (${info.timeoutMs}ms, reason=${info.reason})`,
+        detail: { lock: 'log', timeoutMs: info.timeoutMs },
+      });
+    },
   });
 }
 

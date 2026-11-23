@@ -1,0 +1,7 @@
+{
+  "id": "02-foreign-plugin-env-isolation",
+  "title": "外源 PLUGIN_DATA 与 PLUGIN_ROOT 环境变量不得劫持 note-offload 路径",
+  "incident": "宿主环境继承其他插件 agy-powertools 的 PLUGIN_DATA/PLUGIN_ROOT，导致数据错误写入其他插件目录",
+  "kind": "env_isolation",
+  "foreignPluginName": "agy-powertools"
+}

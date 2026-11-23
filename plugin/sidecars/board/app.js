@@ -1,40 +1,94 @@
-(() => {
-  const $ = (id) => document.getElementById(id);
-  const params = new URLSearchParams(location.search);
-  const uiToken = params.get('token') || '';
-  const CHUNK_STEP_BYTES = 256 * 1024;
-  const MD_RICH_LIMIT_BYTES = 128 * 1024;
+import {
+  badgeClass,
+  canRenderRich,
+  CHUNK_STEP_BYTES,
+  classifyLogLine,
+  esc,
+  filterLogs,
+  fmtBytes,
+  fmtIsoShort,
+  fmtTime,
+  formatFlightLevel,
+  formatFlightSummaryText,
+  inferLatestTurn,
+  isSessionWithinWindow,
+  maskValue,
+  matchWorkspaceFilter,
+  renderDiffView,
+  renderMarkdownRich,
+  sortWorkspaces,
+  splitWorkspaceFiles,
+  validateAliasKey,
+  WS_NAME_RE,
+  wsNameFromSession,
+} from './ui-logic.mjs';
 
-  const state = {
-    tab: 'workspaces',
-    snap: null,
-    search: '',
-    selectedWs: '',
-    selectedFile: '',
-    fileMeta: null,
-    fileSig: '',
-    chunkOffset: 0,
-    forceFull: false,
-    editing: false,
-    editConfirmed: false,
-    revealAliases: false,
-    toastTimer: null,
-    lastViewSig: '',
-    refreshing: false,
-  };
+const $ = (id) => document.getElementById(id);
+const params = new URLSearchParams(location.search);
+const uiToken = params.get('token') || '';
+
+const state = {
+  tab: 'workspaces',
+  snap: null,
+  search: '',
+  wsFilter: 'all',
+  wsSort: 'updated',
+  wsFilterOpen: false,
+  settingsOpen: false,
+  conflictsExpanded: false,
+  conflictsAutoInitialized: false,
+  selectedWs: '',
+  selectedFile: '',
+  fileMeta: null,
+  fileSig: '',
+  chunkOffset: 0,
+  forceFull: false,
+  viewRaw: false,
+  editing: false,
+  editConfirmed: false,
+  pendingNavAction: null,
+  externalChange: null,
+  revealAliases: false,
+  aliasFormOpen: false,
+  editingAliasKey: '',
+  confirmDeleteAliasKey: '',
+  confirmDeleteTimer: null,
+  logFilter: 'all',
+  logQuery: '',
+  lastLogSig: '',
+  diagOpen: false,
+  diagLevel: '',
+  diagEvents: [],
+  diagConfirmClear: false,
+  diagConfirmTimer: null,
+  configSaving: false,
+  toastTimer: null,
+  lastViewSig: '',
+  refreshing: false,
+};
 
   function syncTheme() {
+    let theme = '';
+    const inlineBg = document.documentElement.style.getPropertyValue('--background').trim();
     const probe = document.createElement('span');
-    probe.style.cssText = 'position:absolute;visibility:hidden;color:var(--background, #181a1f)';
+    probe.style.cssText = 'position:absolute;visibility:hidden;color:var(--background)';
     document.documentElement.appendChild(probe);
     const c = getComputedStyle(probe).color;
     probe.remove();
-    const nums = (c.match(/[\d.]+/g) || []).map(Number);
-    if (nums.length >= 3) {
-      const scale = c.startsWith('color(') ? 1 : 255;
-      const [r, g, b] = nums.slice(0, 3).map((v) => v / scale);
-      const lum = 0.2126 * r + 0.7152 * g + 0.0722 * b;
-      document.documentElement.dataset.theme = lum < 0.5 ? 'dark' : 'light';
+    if (inlineBg || (c && c !== 'rgba(0, 0, 0, 0)' && c !== 'transparent')) {
+      const nums = (c.match(/[\d.]+/g) || []).map(Number);
+      if (nums.length >= 3) {
+        const scale = c.startsWith('color(') ? 1 : 255;
+        const [r, g, b] = nums.slice(0, 3).map((v) => v / scale);
+        const lum = 0.2126 * r + 0.7152 * g + 0.0722 * b;
+        theme = lum < 0.5 ? 'dark' : 'light';
+      }
+    }
+    if (!theme && window.matchMedia) {
+      theme = window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
+    }
+    if (theme) {
+      document.documentElement.dataset.theme = theme;
     }
   }
   syncTheme();
@@ -42,15 +96,12 @@
     attributes: true,
     attributeFilter: ['style'],
   });
-
-  const esc = (s) =>
-    String(s ?? '').replace(/[&<>"']/g, (c) => ({
-      '&': '&amp;',
-      '<': '&lt;',
-      '>': '&gt;',
-      '"': '&quot;',
-      "'": '&#39;',
-    }[c]));
+  if (window.matchMedia) {
+    const mq = window.matchMedia('(prefers-color-scheme: dark)');
+    if (typeof mq.addEventListener === 'function') {
+      mq.addEventListener('change', syncTheme);
+    }
+  }
 
   function showToast(msg, isErr = false) {
     const el = $('toast');
@@ -97,105 +148,44 @@
     return data;
   }
 
-  function badgeClass(health) {
-    if (!health || health === '-') return 'muted';
-    if (health.startsWith('DEAD')) return 'err';
-    if (health.startsWith('RETRY')) return 'warn';
-    return 'ok';
+  function getActiveConvId(snap = state.snap) {
+    return window.sidecar?.conversationId || snap?.activeConversationId || '';
   }
 
-  function fmtTime(ms) {
-    if (!ms) return '-';
-    const d = new Date(ms);
-    const pad = (n) => String(n).padStart(2, '0');
-    return `${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
-  }
-
-  function fmtBytes(n) {
-    const val = Number(n || 0);
-    if (val >= 1024 * 1024) return `${(val / (1024 * 1024)).toFixed(2)} MB`;
-    if (val >= 1024) return `${(val / 1024).toFixed(1)} KB`;
-    return `${val} B`;
-  }
-
-  function maskValue(val) {
-    const s = String(val || '');
-    if (s.length <= 12) return '****';
-    return `${s.slice(0, 8)}***${s.slice(-4)}`;
-  }
-
-  function renderMarkdownLite(md) {
-    const lines = String(md || '').split(/\r?\n/);
-    let html = '';
-    let inPre = false;
-    let inList = false;
-
-    const flushList = () => {
-      if (inList) {
-        html += '</ul>';
-        inList = false;
-      }
-    };
-
-    for (const raw of lines) {
-      if (raw.trim().startsWith('```')) {
-        flushList();
-        if (!inPre) {
-          html += '<pre><code>';
-          inPre = true;
-        } else {
-          html += '</code></pre>';
-          inPre = false;
-        }
-        continue;
-      }
-      if (inPre) {
-        html += esc(raw) + '\n';
-        continue;
-      }
-      const line = raw.trim();
-      if (!line) {
-        flushList();
-        continue;
-      }
-      const h = line.match(/^(#{1,3})\s+(.*)$/);
-      if (h) {
-        flushList();
-        const tag = `h${h[1].length}`;
-        html += `<${tag}>${esc(h[2])}</${tag}>`;
-        continue;
-      }
-      const li = line.match(/^[-*]\s+(.*)$/);
-      if (li) {
-        if (!inList) {
-          html += '<ul>';
-          inList = true;
-        }
-        html += `<li>${esc(li[1])}</li>`;
-        continue;
-      }
-      flushList();
-      html += `<p style="margin:4px 0;">${esc(raw)}</p>`;
+  function jumpToConversation(convId) {
+    if (!convId) return;
+    if (window.sidecar?.ui?.toggleConversation) {
+      window.sidecar.ui.toggleConversation(convId);
+      return;
     }
-    flushList();
-    if (inPre) html += '</code></pre>';
-    return html || '<div class="empty-hint">文件内容为空</div>';
+    void copyText(convId).then((ok) => {
+      showToast(ok ? `已复制会话 ID: ${convId.slice(0, 8)}` : '复制失败', !ok);
+    });
+  }
+
+  function launchPromptFor(wsName) {
+    const root = (state.snap?.noteRoot || '~/agy-notes').replace(/\/+$/, '');
+    return `/note-offload 读取 ${root}/${wsName}/task.md 与 status.md，执行下一未完成阶段并落盘汇报。`;
   }
 
   function renderFileViewer(fileName, content) {
     const viewer = $('file-viewer');
-    const isRichMd =
-      String(fileName || '').toLowerCase().endsWith('.md') &&
-      String(content || '').length <= MD_RICH_LIMIT_BYTES;
-    if (isRichMd) {
-      viewer.innerHTML = renderMarkdownLite(content);
-      return;
-    }
-    viewer.innerHTML = '';
+    const lower = String(fileName || '').toLowerCase();
     if (!content) {
       viewer.innerHTML = '<div class="empty-hint">文件内容为空</div>';
       return;
     }
+    if (!state.viewRaw && canRenderRich(fileName, content)) {
+      if (lower.endsWith('.md')) {
+        viewer.innerHTML = renderMarkdownRich(content);
+        return;
+      }
+      if (lower.endsWith('.diff') || lower.endsWith('.patch')) {
+        viewer.innerHTML = renderDiffView(content);
+        return;
+      }
+    }
+    viewer.innerHTML = '';
     const pre = document.createElement('pre');
     pre.className = 'raw-pre';
     const code = document.createElement('code');
@@ -204,9 +194,64 @@
     viewer.appendChild(pre);
   }
 
-  function launchPromptFor(wsName) {
-    const root = (state.snap?.noteRoot || '~/agy-notes').replace(/\/+$/, '');
-    return `/note-offload 读取 ${root}/${wsName}/task.md 与 status.md，执行下一未完成阶段并落盘汇报。`;
+  function isEditorDirty() {
+    if (!state.editing) return false;
+    return $('file-editor').value !== (state.fileMeta?.content ?? '');
+  }
+
+  function updateEditorStatusBar() {
+    const text = $('file-editor').value;
+    const lines = text ? text.split(/\r?\n/).length : 0;
+    const dirty = isEditorDirty();
+    $('editor-dirty-badge').classList.toggle('hidden', !dirty);
+    $('editor-stats').textContent = `${lines} 行 / ${text.length} 字  Ctrl+S 保存`;
+  }
+
+  function hideDirtyGuard() {
+    state.pendingNavAction = null;
+    $('dirty-guard-bar').classList.add('hidden');
+  }
+
+  function hideExternalChangeBar() {
+    state.externalChange = null;
+    $('external-change-bar').classList.add('hidden');
+  }
+
+  function guardDirtyNavigation(actionFn, promptText = '') {
+    if (!isEditorDirty()) {
+      hideDirtyGuard();
+      actionFn();
+      return true;
+    }
+    state.pendingNavAction = actionFn;
+    $('dirty-guard-text').textContent = promptText || '当前编辑内容尚未保存，是否保存后再离开？';
+    $('dirty-guard-bar').classList.remove('hidden');
+    return false;
+  }
+
+  function enterEditMode(content) {
+    state.editing = true;
+    hideDirtyGuard();
+    hideExternalChangeBar();
+    $('edit-risk-bar').classList.add('hidden');
+    $('file-viewer').classList.add('hidden');
+    $('file-editor-wrap').classList.remove('hidden');
+    $('file-editor').value = content;
+    updateEditorStatusBar();
+    updateEditControls(state.fileMeta);
+    $('file-editor').focus();
+  }
+
+  function exitEditModeToViewer() {
+    state.editing = false;
+    hideDirtyGuard();
+    hideExternalChangeBar();
+    $('file-editor-wrap').classList.add('hidden');
+    $('file-viewer').classList.remove('hidden');
+    if (state.fileMeta) {
+      renderFileViewer(state.selectedFile, state.fileMeta.content);
+    }
+    updateEditControls(state.fileMeta);
   }
 
   function computeSnapshotSig(snap) {
@@ -214,82 +259,177 @@
     return JSON.stringify({
       tab: state.tab,
       search: state.search,
+      wsFilter: state.wsFilter,
+      wsSort: state.wsSort,
       wsSel: state.selectedWs,
       fileSel: state.selectedFile,
       reveal: state.revealAliases,
-      activeConv: window.sidecar?.conversationId || snap.activeConversationId || '',
+      activeConv: getActiveConvId(snap),
+      noteRoot: snap.noteRoot,
       dataDir: snap.dataDir,
       config: snap.config,
       hasRealAliases: snap.hasRealAliases,
+      aliasesIsExample: snap.aliasesIsExample,
+      emptyWorkspaceCount: snap.emptyWorkspaceCount,
       conflicts: snap.conflicts,
-      workspaces: snap.workspaces.map((w) => [w.name, w.updatedAtMs, w.health, w.step, w.fileCount, w.summary, w.boundConvId]),
-      trackedSessions: snap.trackedSessions.map((s) => [s.convId, s.health, s.step, s.updatedAtMs, s.noteDir]),
+      workspaces: snap.workspaces.map((w) => [
+        w.name,
+        w.updatedAtMs,
+        w.health,
+        w.step,
+        w.fileCount,
+        w.summary,
+        w.boundConvId,
+        w.taskProgress,
+        w.turnCount,
+        w.latestTurn,
+      ]),
+      trackedSessions: snap.trackedSessions.map((s) => [
+        s.convId,
+        s.wsName,
+        s.health,
+        s.step,
+        s.withinWindow,
+        s.updatedAtMs,
+        s.noteDir,
+      ]),
       aliases: snap.aliases,
       logs: snap.logs,
+      flightSummary: snap.flightSummary,
     });
+  }
+
+  function renderHeaderAndSettings(snap) {
+    const deadCount = snap.trackedSessions.filter((s) => s.dead).length;
+    const summaryEl = $('top-summary');
+    summaryEl.textContent = deadCount
+      ? `${snap.workspaces.length} 工作台 / ${deadCount} 熔断`
+      : `${snap.workspaces.length} 工作台`;
+    summaryEl.classList.toggle('has-alert', deadCount > 0);
+
+    $('settings-version').textContent = snap.version ? `v${snap.version}` : '';
+    $('settings-version').classList.toggle('hidden', !snap.version);
+
+    $('tab-count-workspaces').textContent = snap.workspaces.length ? String(snap.workspaces.length) : '';
+    $('tab-count-aliases').textContent = snap.aliases.length ? String(snap.aliases.length) : '';
+    const alertSessions = snap.trackedSessions.filter((s) => s.dead || s.tries > 0).length;
+    $('tab-count-monitor').textContent = alertSessions
+      ? String(alertSessions)
+      : (snap.trackedSessions.length ? String(snap.trackedSessions.length) : '');
+
+    const cfg = snap.config || { sanitizeEnabled: false, aliasEnabled: false };
+    $('opt-sanitize').checked = Boolean(cfg.sanitizeEnabled);
+    $('opt-alias').checked = Boolean(cfg.aliasEnabled);
+    $('opt-alias-inline').checked = Boolean(cfg.aliasEnabled);
+    $('opt-sanitize').disabled = state.configSaving;
+    $('opt-alias').disabled = state.configSaving;
+    $('opt-alias-inline').disabled = state.configSaving;
+
+    $('env-note-root').textContent = snap.noteRoot || '~/agy-notes';
+    $('env-data-dir').textContent = snap.dataDir || 'plugin_data/note-offload';
+
+    const hasConflicts = Array.isArray(snap.conflicts) && snap.conflicts.length > 0;
+    const dot = $('settings-conflict-dot');
+    dot.classList.toggle('hidden', !hasConflicts);
+    dot.classList.toggle('warn', hasConflicts);
   }
 
   function renderConflicts(conflicts) {
     const banner = $('conflict-banner');
     if (!conflicts || !conflicts.length) {
       banner.classList.add('hidden');
-      banner.innerHTML = '';
+      $('conflict-list').innerHTML = '';
+      state.conflictsAutoInitialized = false;
       return;
     }
     banner.classList.remove('hidden');
-    banner.innerHTML =
-      '<strong>兼容性与配置风险提示</strong>' +
-      `<ul>${conflicts.map((c) => `<li>${esc(c.message)}</li>`).join('')}</ul>`;
+    if (!state.conflictsAutoInitialized) {
+      state.conflictsExpanded = conflicts.some((c) => c.level === 'warn');
+      state.conflictsAutoInitialized = true;
+    }
+    $('conflict-summary').textContent = `检测到 ${conflicts.length} 条兼容性或配置提示`;
+    const list = $('conflict-list');
+    list.innerHTML = conflicts.map((c) => `<li>${esc(c.message)}</li>`).join('');
+    list.classList.toggle('hidden', !state.conflictsExpanded);
+    const btn = $('btn-toggle-conflicts');
+    btn.textContent = state.conflictsExpanded ? '收起' : '展开';
+    btn.setAttribute('aria-expanded', state.conflictsExpanded ? 'true' : 'false');
   }
 
   function renderWorkspaces() {
     const snap = state.snap;
     if (!snap) return;
 
-    const activeConv = window.sidecar?.conversationId || snap.activeConversationId || '';
+    const activeConv = getActiveConvId(snap);
     const kw = state.search.trim().toLowerCase();
-    const list = snap.workspaces.filter((w) => {
-      if (!kw) return true;
-      return w.name.toLowerCase().includes(kw) || (w.summary || '').toLowerCase().includes(kw);
-    });
 
-    const bound = activeConv
-      ? snap.workspaces.find((w) => w.boundConvId === activeConv)
-      : null;
-    const banner = $('bound-banner');
-    if (bound) {
-      banner.classList.remove('hidden');
-      banner.innerHTML = `
-        <span>当前会话已绑定 <strong>${esc(bound.name)}</strong> (${esc(bound.health)})</span>
-        <button type="button" class="btn primary xs" id="btn-open-bound">打开工作台</button>
-      `;
-      $('btn-open-bound').onclick = () => openWorkspace(bound.name);
+    const emptyCount = snap.emptyWorkspaceCount !== undefined
+      ? Number(snap.emptyWorkspaceCount || 0)
+      : (snap.workspaces || []).filter((w) => Number(w.fileCount || 0) === 0).length;
+    const emptyBar = $('empty-clean-bar');
+    if (emptyCount > 0) {
+      emptyBar.classList.remove('hidden');
+      $('empty-clean-text').textContent = `检测到 ${emptyCount} 个 0 文件空目录`;
     } else {
-      banner.classList.add('hidden');
+      emptyBar.classList.add('hidden');
     }
+
+    const filterActive = state.wsFilter !== 'all' || state.wsSort !== 'updated';
+    $('ws-filter-dot').classList.toggle('hidden', !filterActive);
+
+    const list = sortWorkspaces(
+      snap.workspaces.filter((w) => matchWorkspaceFilter(w, { kw, wsFilter: state.wsFilter, activeConv })),
+      { activeConv, wsSort: state.wsSort },
+    );
 
     const container = $('ws-list');
     if (!list.length) {
-      container.innerHTML = '<div class="empty-hint">暂无匹配的落盘工作台，点击右上角「+ 新建」即可创建。</div>';
+      const emptyMsg = snap.workspaces.length
+        ? '没有符合当前筛选条件的工作台'
+        : '暂无落盘工作台，点击右上角「+ 新建」即可创建';
+      container.innerHTML = `<div class="empty-hint">${emptyMsg}</div>`;
       return;
     }
 
     container.innerHTML = list.map((w) => {
       const cls = badgeClass(w.health);
-      const stepPart = w.step != null ? ` | 步数 ${w.step}` : '';
-      const convPart = w.boundConvShort ? ` | 会话 ${esc(w.boundConvShort)}` : '';
+      const isCurrent = Boolean(activeConv && w.boundConvId === activeConv);
+      const prog = w.taskProgress || { done: 0, total: 0 };
+      const progDone = prog.total > 0 && prog.done >= prog.total;
+      const { latestTurn } = inferLatestTurn(w);
+      const tags = [];
+      if (prog.total > 0) {
+        tags.push(`<span class="tag-pill ${progDone ? 'ok' : 'muted'} tabular">待办 ${prog.done}/${prog.total}</span>`);
+      }
+      if (latestTurn !== null && latestTurn !== undefined) {
+        tags.push(`<span class="tag-pill muted tabular">turn-${latestTurn}</span>`);
+      }
+      if (w.boundConvShort) {
+        tags.push(`<span class="tag-pill muted tabular">会话 ${esc(w.boundConvShort)}</span>`);
+      }
+
+      const metaParts = [`${w.fileCount} 文件`];
+      if (w.step != null) metaParts.push(`步数 ${w.step}`);
+      metaParts.push(fmtTime(w.updatedAtMs));
+
       const summary = w.summary ? esc(w.summary) : '暂无状态摘要';
       return `
-        <div class="card ws-card" data-ws="${esc(w.name)}">
+        <div class="card ws-card${isCurrent ? ' is-current' : ''}" data-ws="${esc(w.name)}">
           <div class="ws-head">
-            <span class="ws-name">${esc(w.name)}</span>
+            <div class="ws-title-wrap">
+              <span class="ws-name">${esc(w.name)}</span>
+              ${isCurrent ? '<span class="tag-pill primary">当前会话</span>' : ''}
+            </div>
             <span class="badge ${cls}">${esc(w.health)}</span>
           </div>
-          <div class="ws-meta">${w.fileCount} 个文件${stepPart}${convPart} | ${fmtTime(w.updatedAtMs)}</div>
+          <div class="ws-meta tabular">${metaParts.map((m) => `<span>${esc(m)}</span>`).join('')}</div>
           <div class="ws-summary">${summary}</div>
-          <div class="ws-actions">
-            <button type="button" class="btn secondary xs act-copy" data-ws="${esc(w.name)}">复制启动词</button>
-            ${w.boundConvId ? `<button type="button" class="btn ghost xs act-jump" data-conv="${esc(w.boundConvId)}">切换会话</button>` : ''}
+          <div class="ws-foot">
+            <div class="ws-tags">${tags.join('')}</div>
+            <div class="ws-actions">
+              <button type="button" class="btn secondary xs act-copy" data-ws="${esc(w.name)}">复制启动词</button>
+              ${w.boundConvId ? `<button type="button" class="btn ghost xs act-jump" data-conv="${esc(w.boundConvId)}">切换会话</button>` : ''}
+            </div>
           </div>
         </div>
       `;
@@ -298,7 +438,7 @@
     for (const card of container.querySelectorAll('.ws-card')) {
       card.addEventListener('click', (e) => {
         if (e.target.closest('button')) return;
-        openWorkspace(card.dataset.ws);
+        void openWorkspace(card.dataset.ws);
       });
     }
     for (const btn of container.querySelectorAll('.act-copy')) {
@@ -311,13 +451,7 @@
     for (const btn of container.querySelectorAll('.act-jump')) {
       btn.addEventListener('click', (e) => {
         e.stopPropagation();
-        const cid = btn.dataset.conv;
-        if (window.sidecar?.ui?.toggleConversation) {
-          window.sidecar.ui.toggleConversation(cid);
-        } else {
-          copyText(cid);
-          showToast(`已复制会话 ID: ${cid.slice(0, 8)}`);
-        }
+        jumpToConversation(btn.dataset.conv);
       });
     }
   }
@@ -325,10 +459,15 @@
   function renderDetailHeader() {
     const ws = state.snap?.workspaces.find((w) => w.name === state.selectedWs);
     if (!ws) {
-      backToList();
+      backToList(true);
       return null;
     }
+    const activeConv = getActiveConvId();
+    const isCurrent = Boolean(activeConv && ws.boundConvId === activeConv);
+
     $('detail-name').textContent = ws.name;
+    $('detail-current-tag').classList.toggle('hidden', !isCurrent);
+
     const badge = $('detail-health');
     badge.textContent = ws.health;
     badge.className = `badge ${badgeClass(ws.health)}`;
@@ -336,29 +475,47 @@
     const jumpBtn = $('btn-jump-conv');
     if (ws.boundConvId) {
       jumpBtn.classList.remove('hidden');
-      jumpBtn.onclick = () => {
-        if (window.sidecar?.ui?.toggleConversation) {
-          window.sidecar.ui.toggleConversation(ws.boundConvId);
-        } else {
-          copyText(ws.boundConvId);
-          showToast(`已复制会话 ID: ${ws.boundConvShort}`);
-        }
-      };
+      jumpBtn.onclick = () => jumpToConversation(ws.boundConvId);
     } else {
       jumpBtn.classList.add('hidden');
     }
 
-    const pills = $('file-pills');
+    const { core, more } = splitWorkspaceFiles(ws);
+    const pills = $('file-core-pills');
     if (!ws.files.length) {
       pills.innerHTML = '<span class="muted">目录暂无文件</span>';
-    } else {
-      pills.innerHTML = ws.files.map((f) =>
-        `<button type="button" class="pill ${f === state.selectedFile ? 'active' : ''}" data-file="${esc(f)}">${esc(f)}</button>`
-      ).join('');
-      for (const p of pills.querySelectorAll('.pill')) {
-        p.addEventListener('click', () => loadFile(ws.name, p.dataset.file));
-      }
+      $('file-more-wrap').classList.add('hidden');
+      return ws;
     }
+
+    pills.innerHTML = core.map((f) =>
+      `<button type="button" class="pill ${f === state.selectedFile ? 'active' : ''}" data-file="${esc(f)}">${esc(f)}</button>`,
+    ).join('');
+    for (const p of pills.querySelectorAll('.pill')) {
+      p.addEventListener('click', () => {
+        const target = p.dataset.file;
+        if (target === state.selectedFile) return;
+        guardDirtyNavigation(() => {
+          void loadFile(ws.name, target);
+        });
+      });
+    }
+
+    const moreWrap = $('file-more-wrap');
+    const moreSel = $('file-more-select');
+    if (more.length > 0) {
+      moreWrap.classList.remove('hidden');
+      moreSel.innerHTML =
+        `<option value="">更多文件 (${more.length})</option>` +
+        more.map((f) => `<option value="${esc(f)}">${esc(f)}</option>`).join('');
+      const selectedInMore = more.includes(state.selectedFile);
+      moreSel.value = selectedInMore ? state.selectedFile : '';
+      moreSel.classList.toggle('set', selectedInMore);
+    } else {
+      moreWrap.classList.add('hidden');
+      moreSel.innerHTML = '';
+    }
+
     return ws;
   }
 
@@ -401,13 +558,21 @@
 
   function updateEditControls(data) {
     const toggleBtn = $('btn-toggle-edit');
+    const rawBtn = $('btn-toggle-raw');
     const riskBar = $('edit-risk-bar');
 
     if (!data || data.chunked) {
       toggleBtn.classList.add('hidden');
+      rawBtn.classList.add('hidden');
       riskBar.classList.add('hidden');
       state.editing = false;
       return;
+    }
+
+    const showRawBtn = !state.editing && canRenderRich(state.selectedFile, data.content);
+    rawBtn.classList.toggle('hidden', !showRawBtn);
+    if (showRawBtn) {
+      rawBtn.textContent = state.viewRaw ? '预览' : '源码';
     }
 
     if (data.directEditable) {
@@ -437,42 +602,93 @@
     state.fileSig = '';
     state.chunkOffset = 0;
     state.forceFull = false;
+    state.viewRaw = false;
     state.editing = false;
     state.editConfirmed = false;
     state.lastViewSig = '';
+    hideDirtyGuard();
+    hideExternalChangeBar();
+
     $('ws-list-view').classList.add('hidden');
     $('ws-detail-view').classList.remove('hidden');
     const ws = renderDetailHeader();
     if (!ws) return;
+
     const targetFile = ws.files.includes('status.md')
       ? 'status.md'
       : (ws.files.includes('task.md') ? 'task.md' : ws.files[0] || '');
+
     if (targetFile) {
       await loadFile(wsName, targetFile);
     } else {
       $('current-file-path').textContent = ws.shortPath;
+      $('current-file-meta').textContent = '';
       $('file-viewer').innerHTML = '<div class="empty-hint">该目录暂无可读文件</div>';
       $('file-viewer').classList.remove('hidden');
       $('file-editor-wrap').classList.add('hidden');
       $('chunk-bar').classList.add('hidden');
       $('edit-risk-bar').classList.add('hidden');
       $('btn-toggle-edit').classList.add('hidden');
+      $('btn-toggle-raw').classList.add('hidden');
     }
   }
 
-  function backToList() {
-    state.selectedWs = '';
-    state.selectedFile = '';
-    state.fileMeta = null;
-    state.fileSig = '';
-    state.chunkOffset = 0;
-    state.forceFull = false;
-    state.editing = false;
-    state.editConfirmed = false;
-    state.lastViewSig = '';
-    $('ws-detail-view').classList.add('hidden');
-    $('ws-list-view').classList.remove('hidden');
-    renderWorkspaces();
+  function backToList(force = false) {
+    const doBack = () => {
+      state.selectedWs = '';
+      state.selectedFile = '';
+      state.fileMeta = null;
+      state.fileSig = '';
+      state.chunkOffset = 0;
+      state.forceFull = false;
+      state.viewRaw = false;
+      state.editing = false;
+      state.editConfirmed = false;
+      state.lastViewSig = '';
+      hideDirtyGuard();
+      hideExternalChangeBar();
+      $('ws-detail-view').classList.add('hidden');
+      $('ws-list-view').classList.remove('hidden');
+      renderWorkspaces();
+    };
+    if (force) {
+      doBack();
+    } else {
+      guardDirtyNavigation(doBack, '离开详情页将丢失未保存修改，是否保存？');
+    }
+  }
+
+  async function checkExternalFileChange() {
+    if (!state.editing || !state.selectedWs || !state.selectedFile || state.fileMeta?.chunked || !state.fileSig) {
+      return;
+    }
+    try {
+      const data = await apiPost('/api/file', {
+        workspace: state.selectedWs,
+        file: state.selectedFile,
+        offset: 0,
+        mode: state.forceFull ? 'full' : 'auto',
+        knownSig: state.fileSig,
+      });
+      if (data.unchanged || data.chunked) return;
+      if (state.externalChange?.sig === data.sig) return;
+
+      if (!isEditorDirty()) {
+        state.fileSig = data.sig || `${data.updatedAtMs}:${data.size}`;
+        state.fileMeta = data;
+        $('file-editor').value = data.content;
+        $('current-file-meta').textContent = `${fmtBytes(data.size)}  ${fmtTime(data.updatedAtMs)}`;
+        updateEditorStatusBar();
+        showToast('磁盘文件已更新，已自动同步最新版本');
+        return;
+      }
+
+      state.externalChange = data;
+      $('external-change-text').textContent = `磁盘上的 ${state.selectedFile} 已被更新（${fmtTime(data.updatedAtMs)}），当前保留你的未保存草稿。`;
+      $('external-change-bar').classList.remove('hidden');
+    } catch {
+      // 忽略瞬时读取错误
+    }
   }
 
   async function loadFile(wsName, fileName, options = {}) {
@@ -487,8 +703,11 @@
       state.fileMeta = null;
       state.chunkOffset = 0;
       state.forceFull = false;
+      state.viewRaw = false;
       state.editing = false;
       state.editConfirmed = false;
+      hideDirtyGuard();
+      hideExternalChangeBar();
       $('edit-risk-bar').classList.add('hidden');
     }
     if (typeof options.offset === 'number') {
@@ -499,6 +718,9 @@
     }
 
     renderDetailHeader();
+    const contentEl = $('main-content');
+    const prevScroll = !switchedFile && contentEl ? contentEl.scrollTop : 0;
+
     try {
       const reqBody = {
         workspace: wsName,
@@ -519,19 +741,21 @@
       state.fileMeta = data;
       state.chunkOffset = Number(data.offset || 0);
       $('current-file-path').textContent = data.shortPath;
+      $('current-file-meta').textContent = `${fmtBytes(data.size)}  ${fmtTime(data.updatedAtMs)}`;
 
       updateChunkControls(data);
       updateEditControls(data);
 
       const canEditNow = !data.chunked && (data.directEditable || (data.confirmEditable && state.editConfirmed));
       if (state.editing && canEditNow) {
-        $('file-viewer').classList.add('hidden');
-        $('file-editor-wrap').classList.remove('hidden');
-        $('file-editor').value = data.content;
+        enterEditMode(data.content);
       } else {
         $('file-editor-wrap').classList.add('hidden');
         $('file-viewer').classList.remove('hidden');
         renderFileViewer(fileName, data.content);
+        if (!switchedFile && contentEl) {
+          contentEl.scrollTop = prevScroll;
+        }
       }
     } catch (err) {
       showToast(err.message || '读取文件失败', true);
@@ -539,10 +763,10 @@
   }
 
   async function saveCurrentFile() {
-    if (!state.selectedWs || !state.selectedFile) return;
+    if (!state.selectedWs || !state.selectedFile) return false;
     if (state.fileMeta?.chunked) {
       showToast('分片只读模式下禁止保存，请先加载全文', true);
-      return;
+      return false;
     }
     try {
       await apiPost('/api/workspace/save', {
@@ -554,59 +778,139 @@
       });
       state.editing = false;
       state.fileSig = '';
+      hideExternalChangeBar();
       showToast(`已保存 ${state.selectedFile}`);
       await refreshAll(true);
       await loadFile(state.selectedWs, state.selectedFile, { force: true });
+      return true;
     } catch (err) {
       showToast(err.message || '保存失败', true);
+      return false;
     }
   }
 
+  function openAliasForm(row = null) {
+    state.aliasFormOpen = true;
+    $('alias-form').classList.remove('hidden');
+    if (row) {
+      state.editingAliasKey = row.key;
+      $('alias-form-title').textContent = `编辑别名：${row.key}`;
+      $('alias-key').value = row.key;
+      $('alias-note').value = row.note || '';
+      $('alias-val').value = row.value;
+      $('btn-alias-submit').textContent = '更新别名';
+      updateAliasKeyHint();
+      $('alias-val').focus();
+    } else {
+      state.editingAliasKey = '';
+      $('alias-form-title').textContent = '新增别名映射';
+      $('alias-key').value = '';
+      $('alias-note').value = '';
+      $('alias-val').value = '';
+      $('btn-alias-submit').textContent = '保存别名';
+      updateAliasKeyHint();
+      $('alias-key').focus();
+    }
+  }
+
+  function closeAliasForm() {
+    state.aliasFormOpen = false;
+    state.editingAliasKey = '';
+    $('alias-form').classList.add('hidden');
+  }
+
+  function updateAliasKeyHint() {
+    const check = validateAliasKey($('alias-key').value);
+    const hint = $('alias-key-hint');
+    const input = $('alias-key');
+    input.classList.toggle('invalid', !check.valid);
+    hint.className = check.level === 'err' ? 'field-hint err' : (check.level === 'warn' ? 'field-hint warn' : 'field-hint');
+    hint.textContent = check.text;
+  }
+
   function renderAliases() {
-    if (state.snap?.dataDir) {
-      const pathEl = $('alias-map-path');
-      if (pathEl) pathEl.textContent = `${state.snap.dataDir}/net-map.tsv`;
+    const snap = state.snap;
+    if (!snap) return;
+
+    if (snap.dataDir) {
+      $('alias-map-path').textContent = `${snap.dataDir}/net-map.tsv`;
     }
-    const hintEl = $('alias-status-hint');
-    if (hintEl) {
-      const enabled = Boolean(state.snap?.config?.aliasEnabled);
-      hintEl.textContent = enabled
-        ? (state.snap?.hasRealAliases ? '已开启按需注入，且已配置真实别名表。' : '已开启按需注入（当前尚无真实别名，保存一条后生效）。')
-        : '当前默认关闭自动注入（可在「监控日志」页签开启）。';
-    }
-    const rows = state.snap?.aliases || [];
+
+    const enabled = Boolean(snap.config?.aliasEnabled);
+    const isExample = snap.aliasesIsExample !== undefined
+      ? Boolean(snap.aliasesIsExample)
+      : (!snap.hasRealAliases && (snap.aliases || []).length > 0);
+    $('alias-example-banner').classList.toggle('hidden', !isExample);
+
+    $('alias-status-hint').textContent = enabled
+      ? (snap.hasRealAliases ? '已开启按需注入，真实别名表已生效' : '已开启按需注入，保存真实别名后即生效')
+      : '默认关闭自动注入，可在此随时切换';
+
+    const rows = snap.aliases || [];
     const el = $('alias-list');
     if (!rows.length) {
-      el.innerHTML = '<div class="empty-hint">暂未配置远端地址别名</div>';
+      el.innerHTML = '<div class="empty-hint">暂未配置远端地址别名，点击「+ 新增别名」添加</div>';
       return;
     }
-    el.innerHTML = rows.map((r) => `
-      <div class="card alias-row">
-        <div class="alias-info">
-          <div><strong>${esc(r.key)}</strong> <span class="muted">${esc(r.note || '')}</span></div>
-          <div class="alias-val">${esc(state.revealAliases ? r.value : maskValue(r.value))}</div>
+
+    el.innerHTML = rows.map((r) => {
+      const confirming = state.confirmDeleteAliasKey === r.key;
+      const valText = state.revealAliases ? r.value : maskValue(r.value);
+      return `
+        <div class="card alias-row">
+          <div class="alias-info">
+            <div class="alias-head">
+              <strong>${esc(r.key)}</strong>
+              ${isExample ? '<span class="tag-pill warn">示例</span>' : ''}
+              ${r.note ? `<span class="muted">${esc(r.note)}</span>` : ''}
+            </div>
+            <div class="alias-val">${esc(valText)}</div>
+          </div>
+          <div class="row-gap">
+            <button type="button" class="btn ghost xs act-copy-alias" data-key="${esc(r.key)}">复制</button>
+            <button type="button" class="btn secondary xs act-edit-alias" data-key="${esc(r.key)}">编辑</button>
+            <button type="button" class="btn ${confirming ? 'danger' : 'ghost'} xs act-del-alias" data-key="${esc(r.key)}">
+              ${confirming ? '确认删除?' : '删除'}
+            </button>
+          </div>
         </div>
-        <div class="row-gap">
-          <button type="button" class="btn ghost xs act-edit-alias" data-key="${esc(r.key)}">改</button>
-          <button type="button" class="btn danger xs act-del-alias" data-key="${esc(r.key)}">删</button>
-        </div>
-      </div>
-    `).join('');
+      `;
+    }).join('');
+
+    for (const btn of el.querySelectorAll('.act-copy-alias')) {
+      btn.addEventListener('click', async () => {
+        const ok = await copyText(btn.dataset.key);
+        showToast(ok ? `已复制别名 ${btn.dataset.key}` : '复制失败', !ok);
+      });
+    }
 
     for (const btn of el.querySelectorAll('.act-edit-alias')) {
       btn.addEventListener('click', () => {
         const hit = rows.find((r) => r.key === btn.dataset.key);
-        if (!hit) return;
-        $('alias-key').value = hit.key;
-        $('alias-val').value = hit.value;
-        $('alias-note').value = hit.note || '';
+        if (hit) openAliasForm(hit);
       });
     }
+
     for (const btn of el.querySelectorAll('.act-del-alias')) {
       btn.addEventListener('click', async () => {
+        const key = btn.dataset.key;
+        if (state.confirmDeleteAliasKey !== key) {
+          state.confirmDeleteAliasKey = key;
+          clearTimeout(state.confirmDeleteTimer);
+          state.confirmDeleteTimer = setTimeout(() => {
+            if (state.confirmDeleteAliasKey === key) {
+              state.confirmDeleteAliasKey = '';
+              if (state.tab === 'aliases') renderAliases();
+            }
+          }, 3000);
+          renderAliases();
+          return;
+        }
+        clearTimeout(state.confirmDeleteTimer);
+        state.confirmDeleteAliasKey = '';
         try {
-          await apiPost('/api/alias/delete', { key: btn.dataset.key });
-          showToast(`已删除别名 ${btn.dataset.key}`);
+          await apiPost('/api/alias/delete', { key });
+          showToast(`已删除别名 ${key}`);
           await refreshAll(true);
         } catch (err) {
           showToast(err.message || '删除失败', true);
@@ -615,30 +919,170 @@
     }
   }
 
-  function renderMonitor() {
-    const cfg = state.snap?.config || { sanitizeEnabled: false, aliasEnabled: false };
-    $('opt-sanitize').checked = Boolean(cfg.sanitizeEnabled);
-    $('opt-alias').checked = Boolean(cfg.aliasEnabled);
+  function getFilteredLogs() {
+    const snap = state.snap;
+    return filterLogs(snap?.logs || [], {
+      logFilter: state.logFilter,
+      logQuery: state.logQuery,
+      activeConv8: getActiveConvId(snap).slice(0, 8),
+    });
+  }
 
-    const sessions = state.snap?.trackedSessions || [];
+  function renderDiagnosticsPanel() {
+    $('diag-summary').textContent = formatFlightSummaryText(state.snap?.flightSummary);
+    $('diag-drawer').classList.toggle('hidden', !state.diagOpen);
+    const toggleBtn = $('btn-toggle-diag');
+    toggleBtn.textContent = state.diagOpen ? '收起' : '展开';
+    toggleBtn.setAttribute('aria-expanded', state.diagOpen ? 'true' : 'false');
+
+    const clearBtn = $('btn-diag-clear');
+    clearBtn.textContent = state.diagConfirmClear ? '确认清空?' : '清空日志';
+    clearBtn.className = state.diagConfirmClear ? 'btn danger xs' : 'btn ghost xs';
+
+    if (!state.diagOpen) return;
+    const list = $('diag-events-list');
+    const events = state.diagEvents || [];
+    if (!events.length) {
+      list.innerHTML = '<div class="muted">暂无匹配的飞行诊断事件</div>';
+      return;
+    }
+    list.innerHTML = events.map((ev) => {
+      const lv = formatFlightLevel(ev.level);
+      const dur = Number.isFinite(ev.durationMs) ? `${ev.durationMs}ms` : '';
+      const convTag = ev.conv ? `<span class="tag-pill muted tabular">${esc(ev.conv)}</span>` : '';
+      return (
+        '<div class="diag-row">' +
+          '<div class="diag-row-head">' +
+            `<span class="badge ${lv.cls}">${lv.label}</span>` +
+            `<span class="diag-source">${esc(ev.source || 'core')}</span>` +
+            `<span class="diag-event">${esc(ev.event || 'event')}</span>` +
+            convTag +
+            (dur ? `<span class="muted tabular">${esc(dur)}</span>` : '') +
+            `<span class="diag-ts tabular">${esc(fmtIsoShort(ev.ts))}</span>` +
+          '</div>' +
+          (ev.message ? `<div class="diag-msg">${esc(ev.message)}</div>` : '') +
+        '</div>'
+      );
+    }).join('');
+  }
+
+  async function loadDiagnostics() {
+    try {
+      const res = await apiPost('/api/diagnostics/logs', {
+        limit: 80,
+        level: state.diagLevel,
+      });
+      if (state.snap && res.summary) {
+        state.snap.flightSummary = res.summary;
+      }
+      state.diagEvents = Array.isArray(res.events) ? res.events : [];
+      renderDiagnosticsPanel();
+    } catch (err) {
+      showToast(err.message || '读取飞行诊断日志失败', true);
+    }
+  }
+
+  function renderLogsOnly(force = false) {
+    const filtered = getFilteredLogs();
+    const sig = JSON.stringify([state.logFilter, state.logQuery, filtered]);
+    if (!force && sig === state.lastLogSig) return;
+    state.lastLogSig = sig;
+
+    const box = $('log-box');
+    const prevScrollTop = box.scrollTop;
+    const wasAtTop = prevScrollTop <= 4;
+
+    if (!filtered.length) {
+      const hasRaw = (state.snap?.logs || []).length > 0;
+      box.innerHTML = `<div class="muted">${hasRaw ? '没有匹配当前筛选条件的日志' : '暂无 Hook 调度日志'}</div>`;
+      return;
+    }
+
+    box.innerHTML = filtered.map((line) => {
+      const m = line.match(/^(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2})\s+(.*)$/);
+      const cls = classifyLogLine(line);
+      if (m) {
+        return (
+          `<div class="log-line ${cls}">` +
+            `<span class="log-ts">${esc(m[1])}</span>` +
+            `<span class="log-msg">${esc(m[2])}</span>` +
+          '</div>'
+        );
+      }
+      return `<div class="log-line ${cls}"><span class="log-msg">${esc(line)}</span></div>`;
+    }).join('');
+
+    box.scrollTop = wasAtTop ? 0 : prevScrollTop;
+  }
+
+  function renderMonitor() {
+    const snap = state.snap;
+    if (!snap) return;
+
+    const activeConv = getActiveConvId(snap);
+    const sessions = [...(snap.trackedSessions || [])];
+    sessions.sort((a, b) => {
+      const rank = (s) => {
+        const win = isSessionWithinWindow(s);
+        if (s.dead) return 0;
+        if (s.tries > 0 && win) return 1;
+        if (win) return 2;
+        return 3;
+      };
+      const ra = rank(a);
+      const rb = rank(b);
+      if (ra !== rb) return ra - rb;
+      return Number(b.updatedAtMs || 0) - Number(a.updatedAtMs || 0);
+    });
+
+    const deadCount = sessions.filter((s) => s.dead).length;
+    const retryCount = sessions.filter((s) => !s.dead && s.tries > 0 && isSessionWithinWindow(s)).length;
+    $('session-summary').textContent = sessions.length
+      ? `${sessions.length} 会话 / ${deadCount} 熔断 / ${retryCount} 重试中`
+      : '0 追踪会话';
+
+    const wsSet = new Set((snap.workspaces || []).map((w) => w.name));
     const el = $('session-list');
+
     if (!sessions.length) {
       el.innerHTML = '<div class="empty-hint">暂无追踪会话记录</div>';
     } else {
-      el.innerHTML = sessions.map((s) => `
-        <div class="card alias-row">
-          <div class="alias-info">
-            <div class="row-gap">
-              <strong>${esc(s.convShort)}</strong>
-              <span class="badge ${badgeClass(s.health)}">${esc(s.health)}</span>
-              <span class="muted">步数 ${s.step ?? '-'}</span>
+      el.innerHTML = sessions.map((s) => {
+        const isCurrent = Boolean(activeConv && s.convId === activeConv);
+        const wsName = wsNameFromSession(s);
+        const hasWs = Boolean(wsName && wsSet.has(wsName));
+        const reasonPart = s.dead && s.deadReason ? `原因: ${esc(s.deadReason)}  ` : '';
+        return `
+          <div class="card session-row">
+            <div class="alias-info">
+              <div class="alias-head">
+                <strong class="tabular">${esc(s.convShort)}</strong>
+                ${isCurrent ? '<span class="tag-pill primary">当前</span>' : ''}
+                <span class="badge ${badgeClass(s.health)}">${esc(s.health)}</span>
+                <span class="muted tabular">步数 ${s.step ?? '-'}</span>
+              </div>
+              <div class="alias-val">${reasonPart}${esc(s.noteDir)}  ${fmtTime(s.updatedAtMs)}</div>
             </div>
-            <div class="alias-val">${esc(s.noteDir)} | ${fmtTime(s.updatedAtMs)}</div>
+            <div class="row-gap">
+              ${hasWs ? `<button type="button" class="btn ghost xs act-open-ws" data-ws="${esc(wsName)}">工作台</button>` : ''}
+              <button type="button" class="btn ghost xs act-jump-sess" data-conv="${esc(s.convId)}">切换</button>
+              ${(s.dead || s.tries > 0) ? `<button type="button" class="btn secondary xs act-reset" data-conv="${esc(s.convId)}">解除熔断</button>` : ''}
+            </div>
           </div>
-          ${(s.dead || s.tries > 0) ? `<button type="button" class="btn secondary xs act-reset" data-conv="${esc(s.convId)}">解除熔断</button>` : ''}
-        </div>
-      `).join('');
+        `;
+      }).join('');
 
+      for (const btn of el.querySelectorAll('.act-open-ws')) {
+        btn.addEventListener('click', () => {
+          const targetWs = btn.dataset.ws;
+          switchTab('workspaces', () => {
+            void openWorkspace(targetWs);
+          });
+        });
+      }
+      for (const btn of el.querySelectorAll('.act-jump-sess')) {
+        btn.addEventListener('click', () => jumpToConversation(btn.dataset.conv));
+      }
       for (const btn of el.querySelectorAll('.act-reset')) {
         btn.addEventListener('click', async () => {
           try {
@@ -652,8 +1096,11 @@
       }
     }
 
-    const logs = state.snap?.logs || [];
-    $('log-box').textContent = logs.length ? logs.join('\n') : '暂无调用日志';
+    renderLogsOnly();
+    renderDiagnosticsPanel();
+    if (state.diagOpen) {
+      void loadDiagnostics();
+    }
   }
 
   function renderCurrentView(forceReloadFile = false, forceRender = false) {
@@ -664,11 +1111,7 @@
     const unchanged = !forceRender && sig === state.lastViewSig;
     if (!unchanged) {
       state.lastViewSig = sig;
-      const deadCount = snap.trackedSessions.filter((s) => s.dead).length;
-      $('top-summary').textContent = deadCount
-        ? `${snap.workspaces.length} 工作台 | ${deadCount} 熔断`
-        : `${snap.workspaces.length} 工作台 | 正常`;
-
+      renderHeaderAndSettings(snap);
       renderConflicts(snap.conflicts || []);
 
       if (state.tab === 'workspaces') {
@@ -684,8 +1127,33 @@
       }
     }
 
-    if (forceReloadFile && state.tab === 'workspaces' && state.selectedWs && state.selectedFile && !state.editing) {
-      void loadFile(state.selectedWs, state.selectedFile, { preserveIfEditing: true });
+    if (forceReloadFile && state.tab === 'workspaces' && state.selectedWs && state.selectedFile) {
+      if (state.editing) {
+        void checkExternalFileChange();
+      } else {
+        void loadFile(state.selectedWs, state.selectedFile, { preserveIfEditing: true });
+      }
+    }
+  }
+
+  function switchTab(tabName, afterSwitch = null) {
+    const doSwitch = () => {
+      state.tab = tabName;
+      for (const b of document.querySelectorAll('.tab')) {
+        const active = b.dataset.tab === tabName;
+        b.classList.toggle('active', active);
+        b.setAttribute('aria-selected', active ? 'true' : 'false');
+      }
+      for (const p of document.querySelectorAll('.panel')) {
+        p.classList.toggle('active', p.id === `panel-${tabName}`);
+      }
+      renderCurrentView(false, true);
+      if (typeof afterSwitch === 'function') afterSwitch();
+    };
+    if (state.tab === 'workspaces' && tabName !== 'workspaces') {
+      guardDirtyNavigation(doSwitch, '切换页签前是否保存当前未保存的修改？');
+    } else {
+      doSwitch();
     }
   }
 
@@ -705,6 +1173,11 @@
   }
 
   async function updateConfigOption(patch) {
+    if (state.configSaving) return;
+    state.configSaving = true;
+    $('opt-sanitize').disabled = true;
+    $('opt-alias').disabled = true;
+    $('opt-alias-inline').disabled = true;
     try {
       const conv = window.sidecar?.conversationId || '';
       const res = await apiPost('/api/config/update', {
@@ -715,50 +1188,129 @@
         state.snap.config = res.config;
         state.snap.conflicts = res.conflicts || [];
       }
-      renderConflicts(res.conflicts || []);
-      showToast(res.conflicts?.length ? '已更新配置（发现潜在冲突风险，见顶部提示）' : '已更新可选项配置');
-      await refreshAll(false);
+      showToast(res.conflicts?.length ? '已更新配置，检测到潜在冲突提示' : '已更新配置选项');
     } catch (err) {
       showToast(err.message || '配置更新失败', true);
-      renderMonitor();
+    } finally {
+      state.configSaving = false;
+      if (state.snap) renderHeaderAndSettings(state.snap);
+      await refreshAll(false);
     }
   }
 
+  // 事件绑定：顶栏导航与设置面板
   for (const tabBtn of document.querySelectorAll('.tab')) {
     tabBtn.addEventListener('click', () => {
-      state.tab = tabBtn.dataset.tab;
-      for (const b of document.querySelectorAll('.tab')) {
-        b.classList.toggle('active', b === tabBtn);
-      }
-      for (const p of document.querySelectorAll('.panel')) {
-        p.classList.toggle('active', p.id === `panel-${state.tab}`);
-      }
-      renderCurrentView(false, true);
+      if (tabBtn.dataset.tab === state.tab) return;
+      switchTab(tabBtn.dataset.tab);
     });
   }
 
+  $('btn-refresh').addEventListener('click', () => {
+    const btn = $('btn-refresh');
+    btn.classList.remove('spinning');
+    void btn.offsetWidth;
+    btn.classList.add('spinning');
+    void refreshAll(true);
+  });
+
+  function setSettingsOpen(open) {
+    state.settingsOpen = open;
+    $('settings-panel').classList.toggle('hidden', !open);
+    $('btn-settings').setAttribute('aria-expanded', open ? 'true' : 'false');
+  }
+
+  $('btn-settings').addEventListener('click', () => setSettingsOpen(!state.settingsOpen));
+  $('btn-close-settings').addEventListener('click', () => setSettingsOpen(false));
+
+  $('btn-copy-note-root').addEventListener('click', async () => {
+    const ok = await copyText($('env-note-root').textContent);
+    showToast(ok ? '已复制工作台目录路径' : '复制失败', !ok);
+  });
+
+  $('btn-copy-data-dir').addEventListener('click', async () => {
+    const ok = await copyText($('env-data-dir').textContent);
+    showToast(ok ? '已复制数据目录路径' : '复制失败', !ok);
+  });
+
+  $('btn-toggle-conflicts').addEventListener('click', () => {
+    state.conflictsExpanded = !state.conflictsExpanded;
+    if (state.snap) renderConflicts(state.snap.conflicts || []);
+  });
+
+  // 事件绑定：工作台列表与筛选
   $('ws-search').addEventListener('input', (e) => {
     state.search = e.target.value;
     renderWorkspaces();
   });
 
+  $('btn-ws-filter').addEventListener('click', () => {
+    state.wsFilterOpen = !state.wsFilterOpen;
+    $('ws-filter-bar').classList.toggle('hidden', !state.wsFilterOpen);
+    $('btn-ws-filter').setAttribute('aria-expanded', state.wsFilterOpen ? 'true' : 'false');
+  });
+
+  for (const segBtn of document.querySelectorAll('[data-ws-filter]')) {
+    segBtn.addEventListener('click', () => {
+      state.wsFilter = segBtn.dataset.wsFilter;
+      for (const b of document.querySelectorAll('[data-ws-filter]')) {
+        b.classList.toggle('active', b === segBtn);
+      }
+      renderWorkspaces();
+    });
+  }
+
+  $('ws-sort').addEventListener('change', (e) => {
+    state.wsSort = e.target.value === 'name' ? 'name' : 'updated';
+    renderWorkspaces();
+  });
+
   $('btn-toggle-create').addEventListener('click', () => {
     $('create-box').classList.toggle('hidden');
-    if (!$('create-box').classList.contains('hidden')) $('new-ws-name').focus();
+    if (!$('create-box').classList.contains('hidden')) {
+      $('new-ws-name').focus();
+    }
   });
 
   $('btn-cancel-create').addEventListener('click', () => {
     $('create-box').classList.add('hidden');
   });
 
+  $('new-ws-name').addEventListener('input', () => {
+    const val = $('new-ws-name').value.trim();
+    const hint = $('new-ws-hint');
+    if (!val) {
+      $('new-ws-name').classList.remove('invalid');
+      hint.className = 'field-hint';
+      hint.textContent = '仅支持字母、数字及 . _ -（最多 64 字符）';
+      return;
+    }
+    if (!WS_NAME_RE.test(val)) {
+      $('new-ws-name').classList.add('invalid');
+      hint.className = 'field-hint err';
+      hint.textContent = '名称非法：须以字母或数字开头，仅含字母、数字及 . _ -';
+    } else {
+      $('new-ws-name').classList.remove('invalid');
+      hint.className = 'field-hint';
+      hint.textContent = '名称格式有效';
+    }
+  });
+
   $('create-box').addEventListener('submit', async (e) => {
     e.preventDefault();
     const name = $('new-ws-name').value.trim();
     const taskContent = $('new-ws-task').value;
+    if (!WS_NAME_RE.test(name)) {
+      $('new-ws-name').classList.add('invalid');
+      $('new-ws-name').focus();
+      showToast('工作台名称格式无效', true);
+      return;
+    }
     try {
       const res = await apiPost('/api/workspace/init', { name, taskContent });
       $('new-ws-name').value = '';
       $('new-ws-task').value = '';
+      $('new-ws-name').classList.remove('invalid');
       $('create-box').classList.add('hidden');
       const ok = await copyText(res.launchPrompt);
       showToast(ok ? `已创建 ${res.name} 并复制启动词` : `已创建 ${res.name}`);
@@ -779,7 +1331,21 @@
     }
   });
 
-  $('btn-back').addEventListener('click', backToList);
+  // 事件绑定：详情页文件浏览、防丢稿与编辑
+  $('btn-back').addEventListener('click', () => backToList(false));
+
+  $('file-more-select').addEventListener('change', (e) => {
+    const target = e.target.value;
+    if (!target || target === state.selectedFile) return;
+    const allowed = guardDirtyNavigation(() => {
+      void loadFile(state.selectedWs, target);
+    });
+    if (!allowed) {
+      const ws = state.snap?.workspaces.find((w) => w.name === state.selectedWs);
+      const { more } = ws ? splitWorkspaceFiles(ws) : { more: [] };
+      e.target.value = more.includes(state.selectedFile) ? state.selectedFile : '';
+    }
+  });
 
   $('btn-copy-prompt').addEventListener('click', async () => {
     if (!state.selectedWs) return;
@@ -793,8 +1359,9 @@
     if (window.sidecar?.ui?.toggleAuxPane) {
       window.sidecar.ui.toggleAuxPane({ tabType: 'fileView', uri: `file://${abs}` });
     } else {
-      copyText(abs);
-      showToast('已复制绝对路径');
+      void copyText(abs).then((ok) => {
+        showToast(ok ? '已复制文件绝对路径' : '复制失败', !ok);
+      });
     }
   });
 
@@ -802,6 +1369,13 @@
     const p = state.fileMeta?.shortPath || $('current-file-path').textContent;
     const ok = await copyText(p);
     showToast(ok ? '已复制路径' : '复制失败', !ok);
+  });
+
+  $('btn-toggle-raw').addEventListener('click', () => {
+    if (!state.fileMeta || state.editing) return;
+    state.viewRaw = !state.viewRaw;
+    $('btn-toggle-raw').textContent = state.viewRaw ? '预览' : '源码';
+    renderFileViewer(state.selectedFile, state.fileMeta.content);
   });
 
   $('btn-chunk-prev').addEventListener('click', () => {
@@ -833,23 +1407,14 @@
     const meta = state.fileMeta;
     if (!meta || meta.chunked) return;
     if (state.editing) {
-      state.editing = false;
-      $('file-editor-wrap').classList.add('hidden');
-      $('file-viewer').classList.remove('hidden');
-      updateEditControls(meta);
+      guardDirtyNavigation(() => exitEditModeToViewer(), '退出编辑前是否保存未保存的内容？');
       return;
     }
     if (meta.confirmEditable && !state.editConfirmed) {
       $('edit-risk-bar').classList.remove('hidden');
       return;
     }
-    state.editing = true;
-    $('edit-risk-bar').classList.add('hidden');
-    $('file-viewer').classList.add('hidden');
-    $('file-editor-wrap').classList.remove('hidden');
-    $('file-editor').value = meta.content;
-    $('file-editor').focus();
-    updateEditControls(meta);
+    enterEditMode(meta.content);
   });
 
   $('btn-risk-cancel').addEventListener('click', () => {
@@ -859,46 +1424,99 @@
   $('btn-risk-confirm').addEventListener('click', () => {
     if (!state.fileMeta || state.fileMeta.chunked) return;
     state.editConfirmed = true;
-    state.editing = true;
-    $('edit-risk-bar').classList.add('hidden');
-    $('file-viewer').classList.add('hidden');
-    $('file-editor-wrap').classList.remove('hidden');
-    $('file-editor').value = state.fileMeta.content;
-    $('file-editor').focus();
-    updateEditControls(state.fileMeta);
+    enterEditMode(state.fileMeta.content);
   });
 
   $('btn-cancel-edit').addEventListener('click', () => {
-    state.editing = false;
-    $('file-editor-wrap').classList.add('hidden');
-    $('file-viewer').classList.remove('hidden');
-    updateEditControls(state.fileMeta);
+    guardDirtyNavigation(() => exitEditModeToViewer(), '放弃本次未保存的编辑内容？');
   });
 
-  $('btn-save-file').addEventListener('click', saveCurrentFile);
-  $('file-editor').addEventListener('keydown', (e) => {
-    if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 's') {
-      e.preventDefault();
-      saveCurrentFile();
+  $('btn-dirty-stay').addEventListener('click', () => {
+    hideDirtyGuard();
+    $('file-editor').focus();
+  });
+
+  $('btn-dirty-discard').addEventListener('click', () => {
+    const next = state.pendingNavAction;
+    hideDirtyGuard();
+    exitEditModeToViewer();
+    if (typeof next === 'function') next();
+  });
+
+  $('btn-dirty-save').addEventListener('click', async () => {
+    const next = state.pendingNavAction;
+    const ok = await saveCurrentFile();
+    if (ok) {
+      hideDirtyGuard();
+      if (typeof next === 'function') next();
     }
   });
 
+  $('btn-ext-ignore').addEventListener('click', () => {
+    $('external-change-bar').classList.add('hidden');
+  });
+
+  $('btn-ext-reload').addEventListener('click', () => {
+    const ext = state.externalChange;
+    if (!ext) return;
+    state.fileSig = ext.sig || `${ext.updatedAtMs}:${ext.size}`;
+    state.fileMeta = ext;
+    $('file-editor').value = ext.content;
+    $('current-file-meta').textContent = `${fmtBytes(ext.size)}  ${fmtTime(ext.updatedAtMs)}`;
+    hideExternalChangeBar();
+    hideDirtyGuard();
+    updateEditorStatusBar();
+    showToast('已重新加载磁盘最新版本');
+  });
+
+  $('file-editor').addEventListener('input', () => {
+    updateEditorStatusBar();
+  });
+
+  $('btn-save-file').addEventListener('click', () => {
+    void saveCurrentFile();
+  });
+
+  $('file-editor').addEventListener('keydown', (e) => {
+    if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 's') {
+      e.preventDefault();
+      void saveCurrentFile();
+    } else if (e.key === 'Escape') {
+      e.preventDefault();
+      guardDirtyNavigation(() => exitEditModeToViewer(), '退出编辑前是否保存未保存的内容？');
+    }
+  });
+
+  // 事件绑定：别名表
   $('btn-toggle-reveal').addEventListener('click', () => {
     state.revealAliases = !state.revealAliases;
     $('btn-toggle-reveal').textContent = state.revealAliases ? '隐藏真值' : '显示真值';
     renderAliases();
   });
 
+  $('btn-toggle-alias-form').addEventListener('click', () => {
+    if (state.aliasFormOpen && !state.editingAliasKey) {
+      closeAliasForm();
+    } else {
+      openAliasForm(null);
+    }
+  });
+
+  $('btn-cancel-alias-form').addEventListener('click', closeAliasForm);
+  $('alias-key').addEventListener('input', updateAliasKeyHint);
+
   $('alias-form').addEventListener('submit', async (e) => {
     e.preventDefault();
     const key = $('alias-key').value.trim();
     const value = $('alias-val').value.trim();
     const note = $('alias-note').value.trim();
+    const prevKey = state.editingAliasKey;
     try {
       await apiPost('/api/alias/upsert', { key, value, note });
-      $('alias-key').value = '';
-      $('alias-val').value = '';
-      $('alias-note').value = '';
+      if (prevKey && prevKey !== key) {
+        await apiPost('/api/alias/delete', { key: prevKey }).catch(() => {});
+      }
+      closeAliasForm();
       showToast(`已保存别名 ${key}`);
       await refreshAll(false);
     } catch (err) {
@@ -906,12 +1524,100 @@
     }
   });
 
+  // 事件绑定：开关配置双向同步
   $('opt-sanitize').addEventListener('change', (e) => {
     void updateConfigOption({ sanitizeEnabled: Boolean(e.target.checked) });
   });
 
   $('opt-alias').addEventListener('change', (e) => {
     void updateConfigOption({ aliasEnabled: Boolean(e.target.checked) });
+  });
+
+  $('opt-alias-inline').addEventListener('change', (e) => {
+    void updateConfigOption({ aliasEnabled: Boolean(e.target.checked) });
+  });
+
+  // 事件绑定：监控日志工具栏
+  for (const segBtn of document.querySelectorAll('[data-log-filter]')) {
+    segBtn.addEventListener('click', () => {
+      state.logFilter = segBtn.dataset.logFilter;
+      for (const b of document.querySelectorAll('[data-log-filter]')) {
+        b.classList.toggle('active', b === segBtn);
+      }
+      renderLogsOnly(true);
+    });
+  }
+
+  $('log-search').addEventListener('input', (e) => {
+    state.logQuery = e.target.value;
+    renderLogsOnly(true);
+  });
+
+  $('btn-copy-logs').addEventListener('click', async () => {
+    const lines = getFilteredLogs();
+    if (!lines.length) {
+      showToast('当前没有可复制的日志', true);
+      return;
+    }
+    const ok = await copyText(lines.join('\n'));
+    showToast(ok ? `已复制 ${lines.length} 条日志` : '复制失败', !ok);
+  });
+
+  // 事件绑定：黑匣子飞行诊断
+  $('btn-toggle-diag').addEventListener('click', () => {
+    state.diagOpen = !state.diagOpen;
+    renderDiagnosticsPanel();
+    if (state.diagOpen) {
+      void loadDiagnostics();
+    }
+  });
+
+  $('diag-level-filter').addEventListener('change', (e) => {
+    state.diagLevel = e.target.value || '';
+    void loadDiagnostics();
+  });
+
+  $('btn-diag-refresh').addEventListener('click', () => {
+    void loadDiagnostics();
+  });
+
+  $('btn-diag-clear').addEventListener('click', async () => {
+    if (!state.diagConfirmClear) {
+      state.diagConfirmClear = true;
+      clearTimeout(state.diagConfirmTimer);
+      state.diagConfirmTimer = setTimeout(() => {
+        state.diagConfirmClear = false;
+        renderDiagnosticsPanel();
+      }, 3000);
+      renderDiagnosticsPanel();
+      return;
+    }
+    clearTimeout(state.diagConfirmTimer);
+    state.diagConfirmClear = false;
+    try {
+      const res = await apiPost('/api/diagnostics/clear', {});
+      if (state.snap && res.summary) {
+        state.snap.flightSummary = res.summary;
+      }
+      state.diagEvents = [];
+      renderDiagnosticsPanel();
+      showToast('已清空黑匣子飞行日志');
+    } catch (err) {
+      showToast(err.message || '清空飞行日志失败', true);
+    }
+  });
+
+  // 全局 Esc 关闭浮层表单/面板
+  document.addEventListener('keydown', (e) => {
+    if (e.key !== 'Escape') return;
+    if (e.target === $('file-editor')) return;
+    if (state.settingsOpen) {
+      setSettingsOpen(false);
+    } else if (state.aliasFormOpen) {
+      closeAliasForm();
+    } else if (!$('create-box').classList.contains('hidden')) {
+      $('create-box').classList.add('hidden');
+    }
   });
 
   document.addEventListener('visibilitychange', () => {
@@ -926,4 +1632,3 @@
       void refreshAll(true);
     }
   }, 3000);
-})();

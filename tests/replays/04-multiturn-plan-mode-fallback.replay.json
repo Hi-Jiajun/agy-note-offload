@@ -1,0 +1,9 @@
+{
+  "id": "04-multiturn-plan-mode-fallback",
+  "title": "跨轮 Plan Mode 缺失 model 且超过 40 步仍准确分流至规划精简档",
+  "incident": "长会话第 2 轮进入 Plan Mode 后最终受限步缺失 model 字段，历史仅扫尾 40 步曾误判为 worker 写盘",
+  "kind": "stop_plan_multiturn",
+  "convId": "planmulti-1111-2222-3333-444455556666",
+  "fillerSteps": 52,
+  "expectedMatch": "\\[规划精简\\]"
+}

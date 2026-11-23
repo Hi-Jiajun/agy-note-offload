@@ -16,12 +16,20 @@ import { deleteAlias, hasConfiguredAliases, readAliases, upsertAlias } from '../
 import { loadConfig, saveConfig } from '../../lib/config.mjs';
 import { detectConflicts } from '../../lib/conflicts.mjs';
 import { atomicWriteSync } from '../../lib/lock.mjs';
-import { getDataDir, getNoteRoot, shortPath } from '../../lib/paths.mjs';
+import {
+  appendFlightEvent,
+  clearFlightLogs,
+  readFlightEvents,
+  SLOW_OP_THRESHOLD_MS,
+  summarizeFlightEvents,
+} from '../../lib/logger.mjs';
+import { getDataDir, getNoteRoot, getPluginRoot, shortPath } from '../../lib/paths.mjs';
 import {
   IGNORED_CONV_IDS,
   loadState,
   readLogs,
   resetConvState,
+  RETRY_WINDOW_SEC,
   sessionHealth,
 } from '../../lib/state.mjs';
 import {
@@ -35,6 +43,7 @@ import {
   resolveWorkspaceFile,
   sortWorkspaceFiles,
   statusTemplate,
+  stripMarkdownCode,
   taskTemplate,
   WS_NAME_RE,
   wsNameFromEntry,
@@ -45,6 +54,27 @@ const FULL_LOAD_DEFAULT_BYTES = 1024 * 1024;
 const FULL_LOAD_MAX_BYTES = 5 * 1024 * 1024;
 const CHUNK_BYTES = 256 * 1024;
 const MAX_WRITE_BYTES = 5 * 1024 * 1024;
+const TASK_PROGRESS_MAX_BYTES = 256 * 1024;
+const NO_STORE_HEADERS = Object.freeze({ 'Cache-Control': 'no-store, no-cache, must-revalidate' });
+
+function assetStamp(fileName) {
+  try {
+    return String(Math.floor(statSync(join(__dirname, fileName)).mtimeMs));
+  } catch {
+    return '0';
+  }
+}
+
+function readPluginVersion() {
+  try {
+    const meta = JSON.parse(readFileSync(join(getPluginRoot(), 'plugin.json'), 'utf-8'));
+    return String(meta?.version || '');
+  } catch {
+    return '';
+  }
+}
+
+const PLUGIN_VERSION = readPluginVersion();
 
 class HttpError extends Error {
   constructor(status, message) {
@@ -72,6 +102,55 @@ function readChunkUtf8(filePath, offset, length) {
   }
 }
 
+function readTaskProgress(wsDir) {
+  const taskPath = join(wsDir, 'task.md');
+  try {
+    if (!existsSync(taskPath)) return { done: 0, total: 0 };
+    const st = statSync(taskPath);
+    if (!st.isFile() || st.size > TASK_PROGRESS_MAX_BYTES) {
+      return { done: 0, total: 0 };
+    }
+    const raw = readFileSync(taskPath, 'utf-8');
+    const plain = stripMarkdownCode(raw, { stripInline: false });
+    const re = /^\s*(?:[-*+]|\d+[.)])\s+\[([ xX])\]\s+/gm;
+    let done = 0;
+    let total = 0;
+    let match;
+    while ((match = re.exec(plain)) !== null) {
+      total += 1;
+      if (match[1].toLowerCase() === 'x') done += 1;
+    }
+    return { done, total };
+  } catch {
+    return { done: 0, total: 0 };
+  }
+}
+
+function summarizeTurns(files) {
+  let turnCount = 0;
+  let latestTurn = null;
+  let latestTurnFile = '';
+  for (const name of files) {
+    const m = /^turn-(\d+)\.md$/.exec(name);
+    if (!m) continue;
+    turnCount += 1;
+    const num = Number.parseInt(m[1], 10);
+    if (Number.isInteger(num) && (latestTurn === null || num > latestTurn)) {
+      latestTurn = num;
+      latestTurnFile = name;
+    }
+  }
+  return { turnCount, latestTurn, latestTurnFile };
+}
+
+function isDirEmpty(dirPath) {
+  try {
+    return readdirSync(dirPath).length === 0;
+  } catch {
+    return false;
+  }
+}
+
 function buildSnapshot(activeConvId) {
   const nowSec = Date.now() / 1000;
   const noteRoot = getNoteRoot();
@@ -79,6 +158,7 @@ function buildSnapshot(activeConvId) {
   const state = loadState();
   const cfg = loadConfig(process.env);
   const hasRealAliases = hasConfiguredAliases(process.env);
+  const aliases = readAliases(process.env, { fallbackExample: true });
   const conflicts = detectConflicts({ env: process.env, convId: activeConvId, config: cfg });
   const byWs = new Map();
   const trackedSessions = [];
@@ -91,9 +171,11 @@ function buildSnapshot(activeConvId) {
     byWs.get(wsName).push({ cid, entry });
 
     const health = sessionHealth(entry, nowSec);
+    const ts = Number(entry.ts || 0);
     trackedSessions.push({
       convId: cid,
       convShort: cid.slice(0, 8),
+      wsName,
       noteDir: nd || `${noteRootShort}/${cid.slice(0, 8)}`,
       health,
       dead: health.startsWith('DEAD'),
@@ -101,15 +183,17 @@ function buildSnapshot(activeConvId) {
       tries: Number(entry.tries || 0),
       step: entry.step ?? null,
       offloadMode: Boolean(entry.offload_mode),
-      updatedAtMs: entry.ts ? Math.round(Number(entry.ts) * 1000) : 0,
+      withinWindow: Boolean(ts && (nowSec - ts <= RETRY_WINDOW_SEC)),
+      updatedAtMs: ts ? Math.round(ts * 1000) : 0,
     });
   }
   trackedSessions.sort((a, b) => b.updatedAtMs - a.updatedAtMs);
 
   const workspaces = [];
+  let emptyWorkspaceCount = 0;
   if (existsSync(noteRoot)) {
     for (const ent of readdirSync(noteRoot, { withFileTypes: true })) {
-      if (!ent.isDirectory() || !WS_RE_CHECK(ent.name)) continue;
+      if (!ent.isDirectory()) continue;
       const wsDir = join(noteRoot, ent.name);
       let stat;
       try {
@@ -118,6 +202,11 @@ function buildSnapshot(activeConvId) {
       } catch {
         continue;
       }
+
+      const empty = isDirEmpty(wsDir);
+      if (empty) emptyWorkspaceCount += 1;
+
+      if (!WS_RE_CHECK(ent.name)) continue;
 
       let rawFiles = [];
       try {
@@ -146,6 +235,7 @@ function buildSnapshot(activeConvId) {
         bound = binds[0];
       }
 
+      const turnInfo = summarizeTurns(files);
       workspaces.push({
         name: ent.name,
         shortPath: shortPath(wsDir),
@@ -154,6 +244,11 @@ function buildSnapshot(activeConvId) {
         files,
         hasTask: files.includes('task.md'),
         hasStatus: files.includes('status.md'),
+        taskProgress: readTaskProgress(wsDir),
+        turnCount: turnInfo.turnCount,
+        latestTurn: turnInfo.latestTurn,
+        latestTurnFile: turnInfo.latestTurnFile,
+        isEmpty: empty,
         updatedAtMs: Math.round(latestMtimeMs),
         boundConvId: bound ? bound.cid : '',
         boundConvShort: bound ? bound.cid.slice(0, 8) : '',
@@ -166,16 +261,20 @@ function buildSnapshot(activeConvId) {
   workspaces.sort((a, b) => b.updatedAtMs - a.updatedAtMs);
 
   return {
+    version: PLUGIN_VERSION,
     activeConversationId: activeConvId || '',
     noteRoot: noteRootShort,
     dataDir: shortPath(getDataDir()),
     config: cfg,
     hasRealAliases,
+    aliasesIsExample: !hasRealAliases && aliases.length > 0,
+    emptyWorkspaceCount,
     conflicts,
     workspaces,
     trackedSessions,
-    aliases: readAliases(process.env, { fallbackExample: true }),
+    aliases,
     logs: readLogs(40),
+    flightSummary: summarizeFlightEvents(process.env),
   };
 }
 
@@ -187,13 +286,36 @@ const app = new SidecarApp();
 
 function jsonApi(path, handler, method = 'POST') {
   app.api(path, async (data) => {
+    const t0 = Date.now();
     try {
       if (!data || typeof data !== 'object' || Array.isArray(data)) {
         throw new HttpError(400, '请求参数必须为 JSON 对象');
       }
-      return await handler(data);
+      const result = await handler(data);
+      const durationMs = Date.now() - t0;
+      if (durationMs >= SLOW_OP_THRESHOLD_MS && !path.startsWith('/api/diagnostics/')) {
+        appendFlightEvent(process.env, {
+          level: 'warn',
+          source: 'sidecar',
+          event: 'slow_api',
+          durationMs,
+          message: `Sidecar API ${path} 响应较慢 (${durationMs}ms)`,
+        });
+      }
+      return result;
     } catch (err) {
       const status = Number.isInteger(err?.status) ? err.status : 500;
+      const durationMs = Date.now() - t0;
+      if (status >= 500 || (status >= 400 && status !== 401 && !path.startsWith('/api/diagnostics/'))) {
+        appendFlightEvent(process.env, {
+          level: status >= 500 ? 'error' : 'warn',
+          source: 'sidecar',
+          event: 'api_error',
+          ok: false,
+          durationMs,
+          message: `${path} -> HTTP ${status}: ${err?.message || 'internal error'}`,
+        });
+      }
       return new Response(JSON.stringify({ error: err?.message || 'internal error' }), {
         status,
         contentType: 'application/json; charset=utf-8',
@@ -202,15 +324,34 @@ function jsonApi(path, handler, method = 'POST') {
   }, method);
 }
 
-app.page('/', () => readFileSync(join(__dirname, 'index.html'), 'utf-8'));
+app.page('/', () => {
+  const html = readFileSync(join(__dirname, 'index.html'), 'utf-8')
+    .replace(/\/styles\.css(?:\?v=[^"']+)?/, `/styles.css?v=${assetStamp('styles.css')}`)
+    .replace(/\/app\.js(?:\?v=[^"']+)?/, `/app.js?v=${assetStamp('app.js')}`);
+  return new Response(html, {
+    contentType: 'text/html; charset=utf-8',
+    headers: NO_STORE_HEADERS,
+  });
+});
 
 app.api('/styles.css', () => new Response(readFileSync(join(__dirname, 'styles.css'), 'utf-8'), {
   contentType: 'text/css; charset=utf-8',
+  headers: NO_STORE_HEADERS,
 }), 'GET');
 
-app.api('/app.js', () => new Response(readFileSync(join(__dirname, 'app.js'), 'utf-8'), {
+app.api('/ui-logic.mjs', () => new Response(readFileSync(join(__dirname, 'ui-logic.mjs'), 'utf-8'), {
   contentType: 'application/javascript; charset=utf-8',
+  headers: NO_STORE_HEADERS,
 }), 'GET');
+
+app.api('/app.js', () => {
+  const js = readFileSync(join(__dirname, 'app.js'), 'utf-8')
+    .replace(/\.\/ui-logic\.mjs(?:\?v=[^"']+)?/, `./ui-logic.mjs?v=${assetStamp('ui-logic.mjs')}`);
+  return new Response(js, {
+    contentType: 'application/javascript; charset=utf-8',
+    headers: NO_STORE_HEADERS,
+  });
+}, 'GET');
 
 jsonApi('/api/snapshot', (data) => {
   const conv = data?.conversationId || app.config?.conversationId || '';
@@ -413,6 +554,25 @@ jsonApi('/api/config/update', (data) => {
     ok: true,
     config,
     conflicts: detectConflicts({ env: process.env, convId: conv, config }),
+  };
+}, 'POST');
+
+jsonApi('/api/diagnostics/logs', (data) => {
+  const limit = Number.isFinite(Number(data?.limit)) ? Number(data.limit) : 80;
+  const level = typeof data?.level === 'string' ? data.level : '';
+  const source = typeof data?.source === 'string' ? data.source : '';
+  return {
+    ok: true,
+    summary: summarizeFlightEvents(process.env),
+    events: readFlightEvents(process.env, { limit, level, source }),
+  };
+}, 'POST');
+
+jsonApi('/api/diagnostics/clear', () => {
+  clearFlightLogs(process.env);
+  return {
+    ok: true,
+    summary: summarizeFlightEvents(process.env),
   };
 }, 'POST');
 

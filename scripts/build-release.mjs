@@ -6,6 +6,7 @@ import { createHash } from 'node:crypto';
 import { mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
 import { dirname, join, relative, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { deflateRawSync } from 'node:zlib';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const ROOT = resolve(__dirname, '..');
@@ -46,22 +47,28 @@ function buildZip(entries) {
   const locals = [];
   const central = [];
   let offset = 0;
+  let rawBytes = 0;
 
   for (const item of entries) {
     const filename = Buffer.from(item.relPath, 'utf-8');
     const data = item.data;
+    rawBytes += data.length;
     const crc = crc32(data);
+    const deflated = deflateRawSync(data, { level: 9 });
+    const useDeflate = deflated.length < data.length;
+    const payload = useDeflate ? deflated : data;
+    const method = useDeflate ? 8 : 0;
     const unixMode = (0o100000 | (item.mode & 0o111 ? 0o755 : 0o644)) >>> 0;
 
     const header = Buffer.alloc(30);
     header.writeUInt32LE(0x04034b50, 0);
     header.writeUInt16LE(20, 4);
     header.writeUInt16LE(0x800, 6);
-    header.writeUInt16LE(0, 8);
+    header.writeUInt16LE(method, 8);
     header.writeUInt16LE(0, 10);
     header.writeUInt16LE(0x5421, 12);
     header.writeUInt32LE(crc, 14);
-    header.writeUInt32LE(data.length, 18);
+    header.writeUInt32LE(payload.length, 18);
     header.writeUInt32LE(data.length, 22);
     header.writeUInt16LE(filename.length, 26);
     header.writeUInt16LE(0, 28);
@@ -71,11 +78,11 @@ function buildZip(entries) {
     entry.writeUInt16LE((3 << 8) | 20, 4);
     entry.writeUInt16LE(20, 6);
     entry.writeUInt16LE(0x800, 8);
-    entry.writeUInt16LE(0, 10);
+    entry.writeUInt16LE(method, 10);
     entry.writeUInt16LE(0, 12);
     entry.writeUInt16LE(0x5421, 14);
     entry.writeUInt32LE(crc, 16);
-    entry.writeUInt32LE(data.length, 20);
+    entry.writeUInt32LE(payload.length, 20);
     entry.writeUInt32LE(data.length, 24);
     entry.writeUInt16LE(filename.length, 28);
     entry.writeUInt16LE(0, 30);
@@ -85,9 +92,9 @@ function buildZip(entries) {
     entry.writeUInt32LE((unixMode << 16) >>> 0, 38);
     entry.writeUInt32LE(offset, 42);
 
-    locals.push(header, filename, data);
+    locals.push(header, filename, payload);
     central.push(entry, filename);
-    offset += header.length + filename.length + data.length;
+    offset += header.length + filename.length + payload.length;
   }
 
   const directory = Buffer.concat(central);
@@ -101,7 +108,10 @@ function buildZip(entries) {
   end.writeUInt32LE(offset, 16);
   end.writeUInt16LE(0, 20);
 
-  return Buffer.concat([...locals, directory, end]);
+  return {
+    buffer: Buffer.concat([...locals, directory, end]),
+    rawBytes,
+  };
 }
 
 function main() {
@@ -112,7 +122,7 @@ function main() {
 
   const files = [];
   collectFiles(pluginDir, pluginDir, files);
-  const zipBuf = buildZip(files);
+  const { buffer: zipBuf, rawBytes } = buildZip(files);
   const sha = createHash('sha256').update(zipBuf).digest('hex');
 
   const zipName = `note-offload-v${version}.zip`;
@@ -123,6 +133,8 @@ function main() {
   process.stdout.write(JSON.stringify({
     version,
     files: files.length,
+    rawBytes,
+    zipBytes: zipBuf.length,
     zip: zipName,
     sha256: sha,
   }) + '\n');

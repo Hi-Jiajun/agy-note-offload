@@ -10,6 +10,7 @@ import {
 } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { afterEach, describe, it } from 'node:test';
+import { inflateRawSync } from 'node:zlib';
 import { createSandbox } from './helpers/sandbox.mjs';
 
 const INSTALLER = resolve('scripts', 'install.mjs');
@@ -76,7 +77,7 @@ describe('安装器、卸载器与 Release ZIP 打包', () => {
     assert.equal(existsSync(join(sb.noteRoot, 'keep.txt')), true);
   });
 
-  it('build-release.mjs 生成含完整 plugin 资产的 ZIP 与校验文件', () => {
+  it('build-release.mjs 生成 Deflate 真压缩 ZIP 与校验文件，且可完整无损解压还原', () => {
     const sb = newSandbox();
     const outDir = join(sb.root, 'dist');
     const summaryRaw = execFileSync(process.execPath, [BUILDER, outDir], { env: sb.env, encoding: 'utf-8' });
@@ -86,10 +87,39 @@ describe('安装器、卸载器与 Release ZIP 打包', () => {
 
     assert.equal(existsSync(zipPath), true);
     assert.equal(existsSync(shaPath), true);
+    assert.equal(summary.zipBytes < summary.rawBytes, true, `expected compressed zip (${summary.zipBytes}) < raw (${summary.rawBytes})`);
+
     const zipBytes = readFileSync(zipPath);
-    assert.equal(zipBytes.includes(Buffer.from('plugin.json')), true);
-    assert.equal(zipBytes.includes(Buffer.from('hooks.json')), true);
-    assert.equal(zipBytes.includes(Buffer.from('lib/paths.mjs')), true);
+    const extracted = new Map();
+    let offset = 0;
+    let deflatedCount = 0;
+    while (offset + 30 <= zipBytes.length && zipBytes.readUInt32LE(offset) === 0x04034b50) {
+      const method = zipBytes.readUInt16LE(offset + 8);
+      const compSize = zipBytes.readUInt32LE(offset + 18);
+      const uncompSize = zipBytes.readUInt32LE(offset + 22);
+      const nameLen = zipBytes.readUInt16LE(offset + 26);
+      const extraLen = zipBytes.readUInt16LE(offset + 28);
+      const nameStart = offset + 30;
+      const dataStart = nameStart + nameLen + extraLen;
+      const name = zipBytes.subarray(nameStart, nameStart + nameLen).toString('utf-8');
+      const rawChunk = zipBytes.subarray(dataStart, dataStart + compSize);
+      const inflated = method === 8 ? inflateRawSync(rawChunk) : rawChunk;
+      if (method === 8) deflatedCount += 1;
+      assert.equal(inflated.length, uncompSize, `size mismatch for ${name}`);
+      extracted.set(name, inflated);
+      offset = dataStart + compSize;
+    }
+
+    assert.equal(deflatedCount > 0, true, 'expected at least one deflated entry');
+    assert.equal(extracted.has('plugin.json'), true);
+    assert.equal(extracted.has('hooks.json'), true);
+    assert.equal(extracted.has('lib/paths.mjs'), true);
+    assert.equal(extracted.has('lib/logger.mjs'), true);
+    assert.equal(extracted.has('sidecars/board/ui-logic.mjs'), true);
+    assert.equal(
+      extracted.get('plugin.json').toString('utf-8'),
+      readFileSync(resolve('plugin', 'plugin.json'), 'utf-8'),
+    );
     assert.match(readFileSync(shaPath, 'utf-8'), new RegExp(`^${summary.sha256}\\s+${summary.zip}`));
   });
 });

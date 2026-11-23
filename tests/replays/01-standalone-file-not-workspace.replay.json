@@ -1,0 +1,38 @@
+{
+  "id": "01-standalone-file-not-workspace",
+  "title": "根目录独立普通文件不得误绑为工作台目录",
+  "incident": "2026-11-23 线上会话引用 ~/agy-notes/handover-6th-to-7th-20261123.md 导致 extractNoteDir 误将 .md 文件绑定为 note_dir",
+  "kind": "extract_note_dir",
+  "setup": {
+    "rootFiles": [
+      "handover-20261123.md",
+      "plain-notes-noext"
+    ],
+    "workspaceDirs": [
+      "real-ws",
+      "v2.1-release"
+    ]
+  },
+  "cases": [
+    {
+      "input": "请先阅读 ~/agy-notes/handover-20261123.md 的交接说明",
+      "expectedDir": ""
+    },
+    {
+      "input": "检查 ~/agy-notes/plain-notes-noext 内容",
+      "expectedDir": ""
+    },
+    {
+      "input": "查看 ~/agy-notes/_archive/old-ws/status.md",
+      "expectedDir": ""
+    },
+    {
+      "input": "读取 ~/agy-notes/real-ws/status.md 继续推进",
+      "expectedSuffix": "/real-ws"
+    },
+    {
+      "input": "读取 ~/agy-notes/v2.1-release/task.md 执行验收",
+      "expectedSuffix": "/v2.1-release"
+    }
+  ]
+}

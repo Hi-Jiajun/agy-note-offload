@@ -14,13 +14,45 @@ import { getNoteRoot, noteRootDisplay, shortPath } from './paths.mjs';
 export const WS_NAME_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
 export const FILE_NAME_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,95}\.(md|txt|json|log|csv|tsv|yaml|yml|diff|patch)$/;
 export const EDITABLE_FILES = new Set(['task.md', 'status.md']);
+export const WORKSPACE_FILE_EXT_RE = /\.(?:md|markdown|txt|json|jsonl|log|csv|tsv|yaml|yml|diff|patch|sh|bash|py|mjs|cjs|js|ts|tsx|jsx|png|jpg|jpeg|gif|webp|svg|pdf|zip|tar|gz|tgz|html|htm|css|xml|ini|conf|toml|lock)$/i;
+export const RESERVED_WS_NAMES = new Set(['_archive']);
 
 const NOTE_DIR_RE = /(?:~|\/[^\s"'`<>]+)?\/agy-notes\/([A-Za-z0-9][A-Za-z0-9._-]{0,63})/g;
 const FENCED_CODE_RE = /(`{3,}|~{3,})[\s\S]*?\1/g;
 const INLINE_CODE_RE = /`+[^`\n]*?`+/g;
 const EXPLICIT_CMD_RE = /(?<![A-Za-z0-9._~/-])\/note-offload(?![A-Za-z0-9._/-])/;
 const EXPLICIT_OFF_CMD_RE = /(?<![A-Za-z0-9._~/-])\/note-offload\s+(?:off|disable|stop|exit|关闭|退出)(?![A-Za-z0-9._/-])/i;
-const PLACEHOLDERS = new Set(['name', 'task', 'work', 'dir', 'conv', 'conv8', 'session', 'workspace', 'example']);
+const PLACEHOLDERS = new Set(['name', 'task', 'work', 'dir', 'conv', 'conv8', 'session', 'workspace', 'example', '_archive']);
+
+/**
+ * 判断候选名称是否为 ~/agy-notes/ 根目录下的独立普通文件（严禁绑定为工作台目录）。
+ * @param {string} name
+ * @param {{ noteRoot?: string, followedBySlash?: boolean }} [options]
+ * @returns {boolean}
+ */
+export function isWorkspaceFileCandidate(name, { noteRoot = '', followedBySlash = false } = {}) {
+  if (!name || typeof name !== 'string') return true;
+  if (RESERVED_WS_NAMES.has(name.toLowerCase())) return true;
+  if (noteRoot) {
+    try {
+      const full = join(noteRoot, name);
+      if (existsSync(full)) {
+        const st = statSync(full);
+        if (st.isFile()) return true;
+        if (st.isDirectory()) return false;
+      }
+    } catch {
+      // 忽略磁盘探查失败，继续走后缀判定
+    }
+  }
+  if (WORKSPACE_FILE_EXT_RE.test(name)) {
+    return true;
+  }
+  if (!followedBySlash && noteRoot) {
+    return false;
+  }
+  return false;
+}
 
 function escapeRegex(str) {
   return str.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
@@ -142,14 +174,19 @@ export function extractNoteDir(text, env = process.env) {
   for (const pat of patterns) {
     let match;
     while ((match = pat.exec(cleaned)) !== null) {
-      candidates.push([match.index, match[1]]);
+      const endIdx = match.index + match[0].length;
+      const followedBySlash = cleaned[endIdx] === '/';
+      candidates.push([match.index, match[1], followedBySlash]);
     }
   }
   candidates.sort((a, b) => a[0] - b[0]);
 
-  for (const [, rawName] of candidates) {
+  for (const [, rawName, followedBySlash] of candidates) {
     const name = rawName.replace(/\.+$/, '');
     if (!name || name.includes('..') || !WS_NAME_RE.test(name) || PLACEHOLDERS.has(name.toLowerCase())) {
+      continue;
+    }
+    if (isWorkspaceFileCandidate(name, { noteRoot, followedBySlash })) {
       continue;
     }
     return `${rootDisp}/${name}`;
@@ -158,7 +195,7 @@ export function extractNoteDir(text, env = process.env) {
 }
 
 /**
- * 从状态条目提取工作台短名，未绑定时回退会话 ID 前 8 位。
+ * 从状态条目提取工作台短名，未绑定或为单文件误绑时回退会话 ID 前 8 位。
  * @param {string} conv
  * @param {Record<string, any> | null | undefined} entry
  * @param {NodeJS.ProcessEnv} [env]
@@ -177,7 +214,13 @@ export function wsNameFromEntry(conv, entry, env = process.env) {
     for (const pfx of prefixes) {
       if (nd.startsWith(pfx)) {
         const rel = nd.slice(pfx.length).replace(/\/+$/, '');
-        if (rel && !rel.includes('/') && !rel.includes('..') && WS_NAME_RE.test(rel)) {
+        if (
+          rel &&
+          !rel.includes('/') &&
+          !rel.includes('..') &&
+          WS_NAME_RE.test(rel) &&
+          !isWorkspaceFileCandidate(rel, { noteRoot })
+        ) {
           return rel;
         }
       }
@@ -187,7 +230,7 @@ export function wsNameFromEntry(conv, entry, env = process.env) {
 }
 
 /**
- * 解析工作台绝对目录路径（优先使用已绑定的命名工作台）。
+ * 解析工作台绝对目录路径（优先使用已绑定的命名工作台，自动忽略单文件误绑残留）。
  * @param {string} conv
  * @param {Record<string, any> | null | undefined} [entry]
  * @param {NodeJS.ProcessEnv} [env]
@@ -211,7 +254,13 @@ export function toAbsNoteDir(conv, entry = null, env = process.env) {
           break;
         }
       }
-      if (rel && !rel.includes('/') && !rel.includes('..') && WS_NAME_RE.test(rel)) {
+      if (
+        rel &&
+        !rel.includes('/') &&
+        !rel.includes('..') &&
+        WS_NAME_RE.test(rel) &&
+        !isWorkspaceFileCandidate(rel, { noteRoot })
+      ) {
         return join(noteRoot, rel);
       }
     }
@@ -451,8 +500,8 @@ export function assertOwnedSubpath(rootDir, targetPath) {
  * @returns {string}
  */
 export function resolveWorkspaceDir(name, env = process.env) {
-  if (typeof name !== 'string' || !WS_NAME_RE.test(name)) {
-    const err = new Error('工作台名称非法（仅支持字母、数字及 . _ -）');
+  if (typeof name !== 'string' || !WS_NAME_RE.test(name) || RESERVED_WS_NAMES.has(name.toLowerCase())) {
+    const err = new Error('工作台名称非法（仅支持字母、数字及 . _ -，且不可使用保留名）');
     err.status = 400;
     throw err;
   }

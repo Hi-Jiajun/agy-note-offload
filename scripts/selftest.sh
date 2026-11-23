@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Note Offload 插件全量门禁与沙箱自检入口。
+# Note Offload 插件全量四维门禁与沙箱自检入口。
 # 用法: bash scripts/selftest.sh
 set -euo pipefail
 
@@ -27,17 +27,23 @@ node ./scripts/sync-meta.mjs --check
 echo "2) 扫描仓库隐私、残留文件与安全红线..."
 node ./scripts/check-privacy.mjs
 
-echo "3) 运行 Node 内置模块化测试套件..."
+echo "3) 运行 L1/L2 Node 内置模块化测试与故障回放套件..."
 node --test ./tests/*.test.mjs
 
-echo "4) 验证 Release ZIP 打包输出..."
+echo "4) 运行 L4 技能与提示词行为契约评测..."
+node ./scripts/offload-skill-eval.mjs
+
+echo "5) 运行 L3 真浏览器 CDP UI 冒烟测试（无浏览器时自动跳过）..."
+node ./scripts/offload-ui-smoke.mjs
+
+echo "6) 验证 Deflate 压缩 Release ZIP 打包输出..."
 node ./scripts/build-release.mjs "$TEST_DIST_DIR"
 
 if command -v agy >/dev/null 2>&1; then
-  echo "5) 运行官方 agy plugin validate ./plugin --strict..."
+  echo "7) 运行官方 agy plugin validate ./plugin --strict..."
   agy plugin validate ./plugin --strict --json
 else
-  echo "5) 跳过 agy plugin validate（当前环境未安装 agy CLI）"
+  echo "7) 跳过 agy plugin validate（当前环境未安装 agy CLI）"
 fi
 
 echo "----"

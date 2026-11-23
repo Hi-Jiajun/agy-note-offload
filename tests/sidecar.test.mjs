@@ -46,7 +46,7 @@ async function reqJson(base, token, method, path, body = null, useToken = true) 
     payload = typeof body === 'string' ? body : JSON.stringify(body);
   }
   const resp = await fetch(`${base}${path}`, { method, headers, body: payload });
-  return { status: resp.status, text: await resp.text() };
+  return { status: resp.status, text: await resp.text(), headers: resp.headers };
 }
 
 afterEach(() => {
@@ -97,8 +97,26 @@ describe('Sidecar 后端契约（实测 sidecar_sdk）与前端安全检查', ()
       assert.equal((await reqJson(base, token, 'POST', '/api/snapshot', {}, false)).status, 401);
       assert.equal((await reqJson(base, token, 'POST', '/api/file', { workspace: 'ws1', file: 'task.md' }, false)).status, 401);
       assert.equal((await reqJson(base, token, 'GET', '/api/snapshot', null, false)).status, 405);
-      assert.equal((await reqJson(base, token, 'GET', '/styles.css', null, false)).status, 200);
-      assert.equal((await reqJson(base, token, 'GET', '/app.js', null, false)).status, 200);
+      const indexRes = await reqJson(base, token, 'GET', '/', null, false);
+      assert.equal(indexRes.status, 200);
+      assert.equal((indexRes.headers.get('cache-control') || '').includes('no-store'), true);
+      assert.equal(/\/styles\.css\?v=\d+/.test(indexRes.text), true);
+      assert.equal(/\/app\.js\?v=\d+/.test(indexRes.text), true);
+
+      const cssRes = await reqJson(base, token, 'GET', '/styles.css', null, false);
+      assert.equal(cssRes.status, 200);
+      assert.equal((cssRes.headers.get('cache-control') || '').includes('no-store'), true);
+      assert.equal((await reqJson(base, token, 'GET', '/styles.css?v=2.0.1-ui', null, false)).status, 200);
+
+      const jsRes = await reqJson(base, token, 'GET', '/app.js', null, false);
+      assert.equal(jsRes.status, 200);
+      assert.equal((jsRes.headers.get('cache-control') || '').includes('no-store'), true);
+      assert.equal((await reqJson(base, token, 'GET', '/app.js?v=2.0.1-ui', null, false)).status, 200);
+
+      const logicRes = await reqJson(base, token, 'GET', '/ui-logic.mjs', null, false);
+      assert.equal(logicRes.status, 200);
+      assert.equal((logicRes.headers.get('cache-control') || '').includes('no-store'), true);
+
       assert.equal((await reqJson(base, token, 'GET', '/preload.js', null, false)).status, 200);
 
       const badJson = await reqJson(base, token, 'POST', '/api/workspace/init', '{bad json', true);
@@ -112,14 +130,24 @@ describe('Sidecar 后端契约（实测 sidecar_sdk）与前端安全检查', ()
       const saveRes = await reqJson(base, token, 'POST', '/api/workspace/save', {
         workspace: 'ws1',
         file: 'task.md',
-        content: '# T1 updated\n',
+        content: [
+          '# T1 updated',
+          '- [x] done 1',
+          '- [ ] todo 1',
+          '1. [X] done 2',
+          '```md',
+          '- [ ] fake todo inside fence',
+          '- [x] fake done inside fence',
+          '```',
+          '',
+        ].join('\n'),
       });
       assert.equal(saveRes.status, 200);
 
       const fileRes = await reqJson(base, token, 'POST', '/api/file', { workspace: 'ws1', file: 'task.md' });
       assert.equal(fileRes.status, 200);
       const fileData = JSON.parse(fileRes.text);
-      assert.equal(fileData.content, '# T1 updated\n');
+      assert.equal(fileData.content.includes('# T1 updated'), true);
       assert.equal(fileData.directEditable, true);
 
       // knownSig 未变不重传
@@ -206,7 +234,12 @@ describe('Sidecar 后端契约（实测 sidecar_sdk）与前端安全检查', ()
         400,
       );
 
-      // 4. 别名增删、可选项更新、冲突回显与状态重置
+      // 4. 别名增删、示例状态标记、可选项更新、冲突回显与状态重置
+      const snapBeforeAlias = JSON.parse((await reqJson(base, token, 'POST', '/api/snapshot', {})).text);
+      assert.equal(snapBeforeAlias.hasRealAliases, false);
+      assert.equal(snapBeforeAlias.aliasesIsExample, true);
+      assert.equal(snapBeforeAlias.emptyWorkspaceCount, 0);
+
       const upHex = await reqJson(base, token, 'POST', '/api/alias/upsert', {
         key: 'deadbeef',
         value: 'https://hex.example.com',
@@ -226,41 +259,89 @@ describe('Sidecar 后端契约（实测 sidecar_sdk）与前端安全检查', ()
       assert.equal(delAlias.status, 200);
       assert.equal(JSON.parse(delAlias.text).aliases.some((a) => a.key === 'deadbeef'), false);
 
+      writeFileSync(join(sb.noteRoot, 'ws1', 'turn-3.md'), 'turn3', 'utf-8');
       writeFileSync(
         join(sb.dataDir, '.filter-retry-state.json'),
         JSON.stringify({
-          deadconv1234: { tries: 3, dead: true, dead_reason: 'max_retry', ts: Date.now() / 1000 },
+          deadconv1234: {
+            tries: 3,
+            dead: true,
+            dead_reason: 'max_retry',
+            note_dir: '~/agy-notes/ws1',
+            ts: Date.now() / 1000,
+          },
         }),
       );
       const snap1 = JSON.parse((await reqJson(base, token, 'POST', '/api/snapshot', {})).text);
       assert.equal(snap1.workspaces.length, 1);
       assert.equal(snap1.workspaces[0].files.includes('metrics.csv'), true);
       assert.equal(snap1.workspaces[0].files.includes('patch.diff'), true);
+      assert.deepEqual(snap1.workspaces[0].taskProgress, { done: 2, total: 3 });
+      assert.equal(snap1.workspaces[0].turnCount, 2);
+      assert.equal(snap1.workspaces[0].latestTurn, 3);
+      assert.equal(snap1.workspaces[0].latestTurnFile, 'turn-3.md');
+      assert.equal(snap1.workspaces[0].isEmpty, false);
+      assert.equal(snap1.hasRealAliases, true);
+      assert.equal(snap1.aliasesIsExample, false);
       assert.equal(snap1.trackedSessions[0].dead, true);
+      assert.equal(snap1.trackedSessions[0].wsName, 'ws1');
+      assert.equal(snap1.trackedSessions[0].withinWindow, true);
       assert.deepEqual(snap1.config, { sanitizeEnabled: true, aliasEnabled: true });
 
       assert.equal((await reqJson(base, token, 'POST', '/api/state/reset', { conversationId: 'deadconv1234' })).status, 200);
       const snap2 = JSON.parse((await reqJson(base, token, 'POST', '/api/snapshot', {})).text);
       assert.equal(snap2.trackedSessions[0].dead, false);
 
-      // 5. 空目录清理
+      // 5. 空目录统计与清理
       mkdirSync(join(sb.noteRoot, 'empty-ws'), { recursive: true });
+      const snapWithEmpty = JSON.parse((await reqJson(base, token, 'POST', '/api/snapshot', {})).text);
+      assert.equal(snapWithEmpty.emptyWorkspaceCount, 1);
+
       const cleanRes = JSON.parse((await reqJson(base, token, 'POST', '/api/workspace/clean', {})).text);
       assert.equal(cleanRes.removedCount, 1);
+      const snapAfterClean = JSON.parse((await reqJson(base, token, 'POST', '/api/snapshot', {})).text);
+      assert.equal(snapAfterClean.emptyWorkspaceCount, 0);
+      assert.equal(typeof snapAfterClean.version, 'string');
+      assert.equal(typeof snapAfterClean.flightSummary?.total, 'number');
+
+      // 6. 黑匣子飞行诊断读取与清空（鉴权保护）
+      assert.equal((await reqJson(base, token, 'POST', '/api/diagnostics/logs', {}, false)).status, 401);
+      const diagRes = JSON.parse((await reqJson(base, token, 'POST', '/api/diagnostics/logs', { limit: 20 })).text);
+      assert.equal(diagRes.ok, true);
+      assert.equal(Array.isArray(diagRes.events), true);
+      assert.equal(diagRes.events.length >= 1, true, 'expected prior 400/403 API checks to be recorded in flight log');
+
+      const clearDiag = JSON.parse((await reqJson(base, token, 'POST', '/api/diagnostics/clear', {})).text);
+      assert.equal(clearDiag.ok, true);
+      assert.equal(clearDiag.summary.total, 0);
     } finally {
       child.kill('SIGTERM');
     }
   });
 
-  it('前端不含会导致 flash 降级的 startConversation、无间隔号且启用分片/增量刷新/风险确认', () => {
+  it('前端不含会导致 flash 降级的 startConversation、无间隔号且启用分片/增量刷新/风险确认/防丢稿机制', () => {
     const html = readFileSync(join(SIDECAR_DIR, 'index.html'), 'utf-8');
+    const css = readFileSync(join(SIDECAR_DIR, 'styles.css'), 'utf-8');
     const appJs = readFileSync(join(SIDECAR_DIR, 'app.js'), 'utf-8');
     assert.equal(html.includes('btn-start-conv'), false);
     assert.equal(appJs.includes('startConversation'), false);
-    assert.equal(html.includes('·') || appJs.includes('·'), false);
+    assert.equal(appJs.includes('window.confirm(') || appJs.includes('window.alert('), false);
+    assert.equal(html.includes('·') || css.includes('·') || appJs.includes('·'), false);
     assert.equal(appJs.includes('visibilitychange'), true);
     assert.equal(appJs.includes('computeSnapshotSig'), true);
     assert.equal(appJs.includes('knownSig'), true);
     assert.equal(appJs.includes('confirmRisk'), true);
+    assert.equal(appJs.includes('guardDirtyNavigation'), true);
+    assert.equal(appJs.includes('isEditorDirty'), true);
+    assert.equal(appJs.includes('checkExternalFileChange'), true);
+    assert.equal(html.includes('/styles.css?v='), true);
+    assert.equal(html.includes('/app.js?v='), true);
+    const svgTags = html.match(/<svg\b[^>]*>/g) || [];
+    assert.equal(svgTags.length > 0, true);
+    for (const tag of svgTags) {
+      assert.equal(/\bwidth="\d+"/.test(tag), true, `SVG 缺少 width: ${tag}`);
+      assert.equal(/\bheight="\d+"/.test(tag), true, `SVG 缺少 height: ${tag}`);
+      assert.equal(tag.includes('fill="none"'), true, `SVG 缺少 fill="none": ${tag}`);
+    }
   });
 });

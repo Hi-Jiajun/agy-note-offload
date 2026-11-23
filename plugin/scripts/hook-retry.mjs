@@ -4,6 +4,7 @@
  */
 import { closeSync, existsSync, openSync, readFileSync, readSync, statSync } from 'node:fs';
 import { isActiveControlTowerController } from '../lib/conflicts.mjs';
+import { appendFlightEvent, SLOW_OP_THRESHOLD_MS } from '../lib/logger.mjs';
 import { applySanitizeIfEnabled } from '../lib/sanitize.mjs';
 import {
   appendLog,
@@ -28,6 +29,12 @@ const MAX_RETRY = 2;
 const ZERO_OUT_LIMIT = 2;
 const LONG_ANSWER = 800;
 const BIG_CONTEXT = 120_000;
+const SKIP_REASONS = new Set([
+  'user_canceled',
+  'user_cancelled',
+  'terminal_custom_hook',
+  'injected_response',
+]);
 
 const REWORD =
   '[重写] 请换平实简短的中文重述本轮结论、错误码与下一步，先给结论再分条，控制在 5 行内。';
@@ -158,6 +165,7 @@ function isZeroOutputBlock(rec) {
 }
 
 function main() {
+  const t0 = Date.now();
   const payload = readStdinJson();
   if (!payload) {
     process.stdout.write('{}\n');
@@ -167,19 +175,25 @@ function main() {
   const ev = String(payload.hookEventName || '');
   if (ev && ev !== EXPECTED) {
     appendLog(`${EXPECTED} 事件不匹配 hookEventName=${ev}`);
+    appendFlightEvent(process.env, {
+      level: 'warn',
+      source: 'hook-retry',
+      event: 'event_mismatch',
+      ok: false,
+      message: `${EXPECTED} 事件不匹配 hookEventName=${ev}`,
+    });
+    process.stdout.write('{}\n');
+    return;
+  }
+
+  const conv = payload.conversationId || 'unknown';
+  const reasonTag = String(payload.terminationReason || '');
+  if (SKIP_REASONS.has(reasonTag.toLowerCase())) {
     process.stdout.write('{}\n');
     return;
   }
 
   housekeeping();
-  const conv = payload.conversationId || 'unknown';
-  const reasonTag = String(payload.terminationReason || '');
-  appendLog(`stop conv=${conv} reason=${reasonTag}`);
-
-  if (reasonTag.toLowerCase() === 'user_canceled' || reasonTag.toLowerCase() === 'user_cancelled') {
-    process.stdout.write('{}\n');
-    return;
-  }
 
   const transcript = payload.transcriptPath || '';
   if (!transcript || !existsSync(transcript)) {
@@ -215,6 +229,7 @@ function main() {
 
   let decisionPayload = null;
   let logLine = '';
+  let flightEvent = null;
 
   withStateLock(() => {
     const state = loadState();
@@ -224,6 +239,13 @@ function main() {
     const rewound = Number.isInteger(curStep) && Number.isInteger(prevStep) && curStep < prevStep;
     if (rewound) {
       appendLog(`stop conv=${conv} rewind_reset prev_step=${prevStep} cur_step=${curStep}`);
+      appendFlightEvent(process.env, {
+        level: 'info',
+        source: 'hook-retry',
+        event: 'rewind_reset',
+        conv,
+        message: `检测到步数回退 (${prevStep} -> ${curStep})，已重置重试计数`,
+      });
       const kept = {};
       for (const k of ['alias_injected', 'offload_mode', 'note_dir', 'orch_confirmed', 'ct_confirmed', 'conflict_warned', 'rule_rev']) {
         if (entry[k]) kept[k] = entry[k];
@@ -232,7 +254,6 @@ function main() {
     }
 
     if (isCtController && !(entry.offload_mode && entry.ct_confirmed)) {
-      logLine = `stop conv=${conv} skip=ct_controller`;
       return;
     }
 
@@ -255,7 +276,6 @@ function main() {
         }
         saveState(state);
       }
-      logLine = `stop conv=${conv} skip=unmanaged`;
       return;
     }
 
@@ -312,6 +332,15 @@ function main() {
       state[conv] = entry;
       saveState(state);
       logLine = `stop conv=${conv} ladder=dead reason=context_locked tries=${tries} zero_streak=${zeroStreak}`;
+      flightEvent = {
+        level: 'error',
+        source: 'hook-retry',
+        event: 'circuit_breaker',
+        ok: false,
+        conv,
+        message: `连续零输出熔断 (tries=${tries}, zero_streak=${zeroStreak})`,
+        detail: { reason: 'context_locked', tries, zeroStreak },
+      };
       return;
     }
 
@@ -322,6 +351,15 @@ function main() {
       state[conv] = entry;
       saveState(state);
       logLine = `stop conv=${conv} ladder=dead reason=max_retry tries=${tries}`;
+      flightEvent = {
+        level: 'error',
+        source: 'hook-retry',
+        event: 'circuit_breaker',
+        ok: false,
+        conv,
+        message: `达到重试上限熔断 (tries=${tries})`,
+        detail: { reason: 'max_retry', tries },
+      };
       return;
     }
 
@@ -364,11 +402,32 @@ function main() {
     logLine =
       `stop conv=${conv} tier=${tier} plan=${Number(planMode)} ` +
       `long=${Number(longAnswer)} big=${Number(bigCtx)} ctx=${totalCtx} zero_out=${Number(zeroOut)} turn=${turnNum} dir=${noteDir}`;
+    flightEvent = {
+      level: 'warn',
+      source: 'hook-retry',
+      event: 'stop_retry',
+      conv,
+      message: `触发分级续跑 tier=${tier} turn=${turnNum}`,
+      detail: { tier, planMode, longAnswer, bigCtx, totalCtx, zeroOut, turnNum, noteDir },
+    };
     decisionPayload = { decision: 'continue', reason };
   });
 
+  const durationMs = Date.now() - t0;
   if (logLine) {
     appendLog(logLine);
+  }
+  if (flightEvent) {
+    appendFlightEvent(process.env, { ...flightEvent, durationMs });
+  } else if (durationMs >= SLOW_OP_THRESHOLD_MS) {
+    appendFlightEvent(process.env, {
+      level: 'warn',
+      source: 'hook-retry',
+      event: 'slow_hook',
+      conv,
+      durationMs,
+      message: `Stop hook 执行较慢 (${durationMs}ms)`,
+    });
   }
   if (!decisionPayload) {
     process.stdout.write('{}\n');
@@ -379,6 +438,13 @@ function main() {
 
 try {
   main();
-} catch {
+} catch (err) {
+  appendFlightEvent(process.env, {
+    level: 'error',
+    source: 'hook-retry',
+    event: 'uncaught_error',
+    ok: false,
+    message: err?.message || String(err),
+  });
   process.stdout.write('{}\n');
 }

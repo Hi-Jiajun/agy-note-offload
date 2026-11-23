@@ -1,0 +1,12 @@
+{
+  "id": "05-compact-unlock-and-stop-skip-reasons",
+  "title": "/compact 解除熔断锁定且 Stop 立即跳过 TERMINAL_CUSTOM_HOOK 与 INJECTED_RESPONSE",
+  "incident": "确认卡或自定义终止触发 Stop 时反复扫描 transcript 并写入冗余日志",
+  "kind": "compact_and_stop_skips",
+  "convId": "skipconv-1111-2222-3333-444455556666",
+  "skipReasons": [
+    "TERMINAL_CUSTOM_HOOK",
+    "INJECTED_RESPONSE",
+    "USER_CANCELED"
+  ]
+}

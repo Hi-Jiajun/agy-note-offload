@@ -1,5 +1,25 @@
 # Changelog
 
+## [2.1.0] - 2026-11-24
+
+### Added
+- **五环自进化工程基座**：
+  - Ring 1：新增零依赖脱敏轮转黑匣子飞行记录仪 `plugin/lib/logger.mjs`（`<PLUGIN_DATA>/logs/offload-flight.jsonl`，2 MB x 3 轮转，自动脱敏主目录、私有网段与凭据），并在 Sidecar 监控页接入黑匣子飞行诊断抽屉与一键清空；
+  - Ring 2：新增只读遥测矿机 `scripts/offload-miner.mjs`（`npm run mine`）；
+  - Ring 3：新增 5 份脱敏真实故障回放夹具 `tests/replays/*.replay.json` 与回放器 `scripts/offload-replay.mjs`（`npm run replay`）；
+  - Ring 4：抽离 Sidecar 纯前端逻辑 `plugin/sidecars/board/ui-logic.mjs` 与 L1 单测 `tests/ui-logic.test.mjs`，新增零依赖无头 Chrome CDP 真浏览器 Aux Pane 冒烟测试 `scripts/offload-ui-smoke.mjs`（`npm run test:ui`）与 L4 技能提示词行为契约评测 `scripts/offload-skill-eval.mjs`（`npm run test:eval`）；
+  - Ring 5：新增实装前快照与秒级回滚工具 `scripts/offload-release.mjs`（`<PLUGIN_DATA>/releases/` 保留最近 3 份）及运行态体检探针 `scripts/offload-doctor.mjs`（`npm run doctor`）。
+- **架构蓝图与多平台发布流水线**：新增 `docs/ARCHITECTURE-ROADMAP.md`、GitHub Actions `ubuntu-latest` + `macos-latest` CI 矩阵及 `v*` Release Tag 自动构建发布流水线 `.github/workflows/release.yml`。
+
+### Changed
+- **Sidecar UI 交互与视觉升级**：新增任务勾选进度统计、工作台状态筛选与排序、Markdown 表格与 Diff 富渲染、未保存防丢稿守卫、编辑态外部文件变更检测、可折叠设置抽屉与冲突条、`Cache-Control: no-store` 与资源版本戳防缓存。
+- **Release ZIP 真压缩**：`scripts/build-release.mjs` 升级使用 Node 内置 `zlib.deflateRawSync` 压缩打包并增加无损解压单测校验。
+
+### Fixed
+- **修复独立普通文件误绑工作台**：`extractNoteDir` / `wsNameFromEntry` / `toAbsNoteDir` 新增 `isWorkspaceFileCandidate` 校验，拦截 `~/agy-notes/` 根目录下 `.md` 等独立文件与 `_archive` 目录被误绑为 `note_dir`。
+- **消除高频噪声日志与冗余 `Stop` 触发**：`hook-retry.mjs` 早期跳过 `TERMINAL_CUSTOM_HOOK` 与 `INJECTED_RESPONSE`，`hook-notice.mjs` 与 `hook-retry.mjs` 不再在每轮 `skip_ct_controller` / `skip=unmanaged` / 正常回合刷屏写入 `hook-invocations.log` 与抢锁，并消除静默 `catch {}`。
+- **加固文件锁超时可观测性**：`plugin/lib/lock.mjs` 新增 `onTimeout` 告警回调与 `strict` 严格抛错模式（`ELOCKTIMEOUT`），并在状态锁/日志锁超时时向黑匣子记录警告。
+
 ## [2.0.0] - 2026-11-22
 
 ### Changed

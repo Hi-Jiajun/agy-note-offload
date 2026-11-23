@@ -7,6 +7,7 @@ import { join } from 'node:path';
 import { hasConfiguredAliases } from '../lib/aliases.mjs';
 import { loadConfig } from '../lib/config.mjs';
 import { detectConflicts, isActiveControlTowerController } from '../lib/conflicts.mjs';
+import { appendFlightEvent, SLOW_OP_THRESHOLD_MS } from '../lib/logger.mjs';
 import { getMapPath, getPluginRoot, shortPath } from '../lib/paths.mjs';
 import { applySanitizeIfEnabled } from '../lib/sanitize.mjs';
 import {
@@ -215,6 +216,7 @@ function buildConflictMarkdown(conflicts) {
 }
 
 function main() {
+  const t0 = Date.now();
   const payload = readStdinJson();
   if (!payload) {
     process.stdout.write('{}\n');
@@ -224,6 +226,13 @@ function main() {
   const ev = String(payload.hookEventName || '');
   if (ev && ev !== EXPECTED) {
     appendLog(`${EXPECTED} 事件不匹配 hookEventName=${ev}`);
+    appendFlightEvent(process.env, {
+      level: 'warn',
+      source: 'hook-notice',
+      event: 'event_mismatch',
+      ok: false,
+      message: `${EXPECTED} 事件不匹配 hookEventName=${ev}`,
+    });
     process.stdout.write('{}\n');
     return;
   }
@@ -270,6 +279,14 @@ function main() {
     });
     if (unlocked) {
       appendLog(`preinvocation compact_unlock conv=${conv}`);
+      appendFlightEvent(process.env, {
+        level: 'info',
+        source: 'hook-notice',
+        event: 'compact_unlock',
+        conv,
+        durationMs: Date.now() - t0,
+        message: '用户执行 /compact，已解除重试与熔断标记',
+      });
     }
     process.stdout.write('{}\n');
     return;
@@ -282,6 +299,7 @@ function main() {
 
   let output = null;
   const pendingLogs = [];
+  const pendingFlight = [];
 
   withStateLock(() => {
     const state = loadState();
@@ -305,12 +323,12 @@ function main() {
       saveState(state);
       const offMsg = applySanitizeIfEnabled(OFFLOAD_OFF_RULE, process.env, cfg);
       pendingLogs.push(`preinvocation offload_off conv=${conv}`);
+      pendingFlight.push({ level: 'info', event: 'offload_off', message: '会话显式关闭落盘模式' });
       output = { injectSteps: [{ systemMessage: { systemMessage: offMsg } }] };
       return;
     }
 
     if (isCtController && !explicitOffload && !existingEntry?.pending_orch_prompt && !(existingEntry?.offload_mode && existingEntry?.ct_confirmed)) {
-      pendingLogs.push(`preinvocation skip_ct_controller conv=${conv}`);
       return;
     }
 
@@ -326,6 +344,7 @@ function main() {
         state[conv] = entry;
         saveState(state);
         pendingLogs.push(`preinvocation bind_silent conv=${conv} dir=${wsDir}`);
+        pendingFlight.push({ level: 'info', event: 'bind_silent', message: `静默绑定工作台 ${wsDir}`, detail: { noteDir: wsDir } });
         return;
       }
     } else {
@@ -336,6 +355,7 @@ function main() {
     const prevStep = entry.step;
     if (Number.isInteger(initSteps) && Number.isInteger(prevStep) && initSteps <= prevStep) {
       pendingLogs.push(`preinvocation rewind_reset conv=${conv} prev_step=${prevStep} init_steps=${initSteps}`);
+      pendingFlight.push({ level: 'info', event: 'rewind_reset', message: `步数回退 (${prevStep} -> ${initSteps})，重置会话状态` });
       if ((explicitOffload || wsDir) && (!isCtController || explicitOffload)) {
         const keptDir = wsDir || entry.note_dir;
         entry = { ts: now };
@@ -385,6 +405,7 @@ function main() {
           replayedSavedPrompt = true;
         }
         pendingLogs.push(`preinvocation confirm_accepted conv=${conv} reasons=${reasons.join(',')}`);
+        pendingFlight.push({ level: 'info', event: 'confirm_accepted', message: `确认开启落盘 (${reasons.join(',')})`, detail: { reasons } });
       } else {
         delete entry.pending_orch_prompt;
         delete entry.pending_confirm_reasons;
@@ -392,6 +413,7 @@ function main() {
           state[conv] = entry;
           saveState(state);
           pendingLogs.push(`preinvocation confirm_declined_ct conv=${conv}`);
+          pendingFlight.push({ level: 'info', event: 'confirm_declined_ct', message: '总控会话放弃开启落盘' });
           return;
         }
       }
@@ -412,6 +434,7 @@ function main() {
         saveState(state);
         const card = buildRiskConfirmCard(conv, entry, { needsOrchConfirm, needsCtConfirm });
         pendingLogs.push(`preinvocation confirm_prompt conv=${conv} reasons=${reasons.join(',')}`);
+        pendingFlight.push({ level: 'info', event: 'confirm_prompt', message: `弹出零配额风险确认卡 (${reasons.join(',')})`, detail: { reasons } });
         output = {
           injectSteps: [
             {
@@ -448,6 +471,12 @@ function main() {
           },
         });
         pendingLogs.push(`preinvocation block_${blockKind} conv=${conv} reason=${deadReason}`);
+        pendingFlight.push({
+          level: 'warn',
+          event: `block_${blockKind}`,
+          message: `拦截熔断会话空转 (${blockKind}, reason=${deadReason})`,
+          detail: { blockKind, deadReason },
+        });
         output = { injectSteps: steps, terminationBehavior: 'terminate' };
         return;
       }
@@ -465,6 +494,7 @@ function main() {
           },
         });
         pendingLogs.push(`preinvocation notice conv=${conv} reason=${deadReason}`);
+        pendingFlight.push({ level: 'warn', event: 'dead_notice_pass', message: `熔断会话放行全新指令 (reason=${deadReason})` });
       }
     } else if (!replayedSavedPrompt) {
       if (curSig) {
@@ -501,6 +531,12 @@ function main() {
       const rule = applySanitizeIfEnabled(ruleTpl.replaceAll('{dir}', noteDir), process.env, cfg);
       steps.push({ systemMessage: { systemMessage: rule } });
       pendingLogs.push(`preinvocation ${isUpgradeRefresh ? 'rule_refresh' : 'alias'} conv=${conv} dir=${noteDir}`);
+      pendingFlight.push({
+        level: 'info',
+        event: isUpgradeRefresh ? 'rule_refresh' : 'rule_inject',
+        message: `${isUpgradeRefresh ? '升级刷新' : '注入'}落盘规则 -> ${noteDir}`,
+        detail: { noteDir, ruleRev: RULE_REV },
+      });
     }
 
     if (offloadMode && !entry.conflict_warned) {
@@ -521,6 +557,12 @@ function main() {
             },
           });
           pendingLogs.push(`preinvocation conflict_warn conv=${conv} count=${conflicts.length}`);
+          pendingFlight.push({
+            level: 'warn',
+            event: 'conflict_warn',
+            message: `检测到 ${conflicts.length} 条兼容性冲突提示`,
+            detail: { codes: conflicts.map((c) => c.code) },
+          });
         }
       }
     }
@@ -532,14 +574,40 @@ function main() {
     }
   });
 
+  const durationMs = Date.now() - t0;
   for (const line of pendingLogs) {
     appendLog(line);
+  }
+  for (const evItem of pendingFlight) {
+    appendFlightEvent(process.env, {
+      ...evItem,
+      source: 'hook-notice',
+      conv,
+      durationMs,
+    });
+  }
+  if (!pendingFlight.length && durationMs >= SLOW_OP_THRESHOLD_MS) {
+    appendFlightEvent(process.env, {
+      level: 'warn',
+      source: 'hook-notice',
+      event: 'slow_hook',
+      conv,
+      durationMs,
+      message: `PreInvocation hook 执行较慢 (${durationMs}ms)`,
+    });
   }
   process.stdout.write(`${JSON.stringify(output || {})}\n`);
 }
 
 try {
   main();
-} catch {
+} catch (err) {
+  appendFlightEvent(process.env, {
+    level: 'error',
+    source: 'hook-notice',
+    event: 'uncaught_error',
+    ok: false,
+    message: err?.message || String(err),
+  });
   process.stdout.write('{}\n');
 }

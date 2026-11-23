@@ -6,17 +6,18 @@
 
 | 路径 | 职责说明 |
 | --- | --- |
-| `package.json` | 工程根配置与单一版本源（`2.0.0`） |
+| `package.json` | 工程根配置与单一版本源（`2.1.0`） |
+| `docs/ARCHITECTURE-ROADMAP.md` | L1 架构不变量与五环自进化演进蓝图（不打入运行态 `plugin/`） |
 | `plugin/` | 纯净运行态 Antigravity 原生插件包（`agy plugin validate ./plugin --strict` 零告警，支持整目录同步与 Release ZIP 分发） |
 | `plugin/plugin.json` | Antigravity 原生插件清单 |
 | `plugin/hooks.json` | 插件相对路径声明的 `SessionStart` / `Stop` / `PreInvocation` 生命周期钩子 |
-| `plugin/lib/` | 零第三方依赖 Node.js ESM 共享内核（`paths.mjs`、`lock.mjs`、`config.mjs`、`sanitize.mjs`、`workspace.mjs`、`state.mjs`、`aliases.mjs`、`conflicts.mjs`） |
+| `plugin/lib/` | 零第三方依赖 Node.js ESM 共享内核（`paths.mjs`、`lock.mjs`、`logger.mjs`、`config.mjs`、`sanitize.mjs`、`workspace.mjs`、`state.mjs`、`aliases.mjs`、`conflicts.mjs`） |
 | `plugin/scripts/` | 插件内聚 Hook 与 CLI 入口（`hook-*.mjs`、`agynote.mjs`、`agysum.mjs`、`neturl.mjs`、`net-map.tsv.example`） |
 | `plugin/skills/note-offload/SKILL.md` | `note-offload` 技能规程与相对路径工具引用 |
-| `plugin/sidecars/board/` | 零第三方依赖的侧边栏 Aux Pane Sidecar Web UI（纯正接入 `sidecar_sdk`） |
+| `plugin/sidecars/board/` | 零第三方依赖的侧边栏 Aux Pane Sidecar Web UI（纯正接入 `sidecar_sdk`，含 `ui-logic.mjs` 纯逻辑模块） |
 | `plugin/assets/logo.svg` | 插件图标 |
-| `scripts/` | 工程期脚本（`selftest.sh`、`sync-meta.mjs`、`check-privacy.mjs`、`build-release.mjs`、`install.mjs`、`uninstall.mjs`） |
-| `tests/` | 基于 `node --test` 的隔离沙箱模块化测试套件与 `tests/helpers/` 测试桩 |
+| `scripts/` | 工程期脚本（`selftest.sh`、`sync-meta.mjs`、`check-privacy.mjs`、`build-release.mjs`、`offload-miner.mjs`、`offload-replay.mjs`、`offload-ui-smoke.mjs`、`offload-skill-eval.mjs`、`offload-doctor.mjs`、`offload-release.mjs`、`install.mjs`、`uninstall.mjs`） |
+| `tests/` | 基于 `node --test` 的隔离沙箱模块化测试套件、`tests/replays/` 真实故障回放夹具与 `tests/helpers/` 测试桩 |
 | `install.sh` / `uninstall.sh` | 本地源码同步至 `~/.gemini/config/plugins/note-offload/` 的轻量安装/卸载包装 |
 
 ## 开发态与运行态严格隔离（核心红线）
