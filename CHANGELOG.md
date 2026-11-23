@@ -1,5 +1,21 @@
 # Changelog
 
+## [2.2.0] - 2026-11-24
+
+### Added
+- **全量可编辑配置中心与一键恢复默认**：扩展 `<PLUGIN_DATA>/config.json`（及 Sidecar 设置面板与 `agynote.mjs config`）支持在线编辑 `orchestratorConfirm`（`once` 默认 / `per_session` / `off`）、`maxRetry`（`1..5`）、`retryWindowMin`（`1..120`）、`zeroOutLimit`（`1..5`）、`longAnswerTokens`（`200..8000`）、`bigContextTokens`（`20000..1000000`）、`sanitizeEnabled` 与 `aliasEnabled`，并新增 `/api/config/reset` 与 `agynote config --reset` 一键恢复内置默认。
+- **百级工作台增量缓存与逻辑/物理归档**：
+  - 新增 `plugin/lib/archive.mjs`（`<PLUGIN_DATA>/archived.json`），默认采用**逻辑归档**（不移动磁盘目录，保证旧会话 `file://` 与 `SESSION-REGISTRY.md` 链接零断裂），Sidecar 列表与 `agynote status` 默认隐藏归档项并支持「已归档」筛选与一键恢复；`agynote archive <ws> --move` 支持可选物理移入 `~/agy-notes/_archive/`，`unarchive` 统一恢复。
+  - Sidecar `/api/snapshot` 引入基于目录与 `task.md`/`status.md` 签名（`mtimeMs:size`）的内存增量缓存，避免 100+ 工作台下每 3 秒重复扫描未变更目录。
+- **单工作台多会话历史关联**：Sidecar 工作台详情页与 `agynote show` 完整展示关联至同一工作台的所有历史会话（按最近活跃排序，支持一键切换/复制）。
+- **CLI 工具全面增强**：
+  - `agysum.mjs` 新增 `512 KB` 倍增尾部分块快读、默认修改文件清单页脚（最多 15 个唯一路径）、`--tools`、`--search <kw>` 与 `--json`；
+  - `agynote.mjs` 新增 `reset <convPrefix>`、`archive <ws> [--move]`、`unarchive <ws>`、`status [all] [--archived] [--dead] [--filter <kw>] [--json]` 与完整 `config` 参数。
+
+### Changed
+- **`Orchestrator` 默认首启一次性确认（`once`）**：首次在 `Orchestrator` 启用落盘并确认后全局持久化 `orchestratorConfirmedOnce=true`，后续新会话不再重复打断（`per_session` 下回复「永久确认」亦可一键切回 `once`）；`control-tower` 现役总控确认继续坚持严格会话级保护。
+- **插件版本感知的规则自动刷新**：`hook-notice.mjs` 将 `rule_version` 升级为 `<plugin.json version>#<RULE_REV>`，未来每次版本升级都会自动为存量活跃落盘会话平滑刷新一次规则。
+
 ## [2.1.0] - 2026-11-24
 
 ### Added

@@ -441,6 +441,9 @@ export function cleanEmptyWorkspaces(env = process.env) {
     .sort((a, b) => a.name.localeCompare(b.name));
 
   for (const ent of entries) {
+    if (RESERVED_WS_NAMES.has(ent.name.toLowerCase())) {
+      continue;
+    }
     const full = join(noteRoot, ent.name);
     try {
       if (lstatSync(full).isSymbolicLink() || !ent.isDirectory()) {

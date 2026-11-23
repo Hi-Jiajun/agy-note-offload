@@ -80,6 +80,54 @@
               <span class="switch-track" aria-hidden="true"></span>
             </label>
           </div>
+          <div class="switch-row">
+            <div class="switch-copy">
+              <span class="switch-title">Orchestrator 启用确认策略</span>
+              <span class="switch-desc" id="orch-once-status">首启确认一次后全局记住（总控始终按会话确认）</span>
+            </div>
+            <div class="row-gap">
+              <span class="select sm">
+                <select id="opt-orch-confirm" aria-label="Orchestrator 确认策略">
+                  <option value="once">首启一次 (推荐)</option>
+                  <option value="per_session">每会话确认</option>
+                  <option value="off">关闭确认</option>
+                </select>
+              </span>
+              <button id="btn-reset-orch-once" type="button" class="btn ghost xs hidden">重弹</button>
+            </div>
+          </div>
+        </div>
+        <div class="settings-thresholds">
+          <div class="settings-subhead">
+            <span class="switch-title">重试与熔断阈值</span>
+            <span class="switch-desc">修改后点击保存即可即时生效</span>
+          </div>
+          <div class="threshold-grid">
+            <label class="threshold-field">
+              <span>最大重试 (1-5)</span>
+              <input id="opt-max-retry" class="input xs" type="number" min="1" max="5" step="1">
+            </label>
+            <label class="threshold-field">
+              <span>重试窗口分钟 (1-120)</span>
+              <input id="opt-retry-window" class="input xs" type="number" min="1" max="120" step="1">
+            </label>
+            <label class="threshold-field">
+              <span>零输出上限 (1-5)</span>
+              <input id="opt-zero-limit" class="input xs" type="number" min="1" max="5" step="1">
+            </label>
+            <label class="threshold-field">
+              <span>长输出阈值 (tokens)</span>
+              <input id="opt-long-tokens" class="input xs" type="number" min="200" max="8000" step="50">
+            </label>
+            <label class="threshold-field">
+              <span>大上下文阈值 (tokens)</span>
+              <input id="opt-big-ctx" class="input xs" type="number" min="20000" max="1000000" step="10000">
+            </label>
+          </div>
+          <div class="settings-actions">
+            <button id="btn-reset-settings" type="button" class="btn ghost xs">恢复默认</button>
+            <button id="btn-save-settings" type="button" class="btn primary xs">保存阈值</button>
+          </div>
         </div>
         <div class="env-grid">
           <button type="button" class="env-item" id="btn-copy-note-root" title="点击复制工作台根目录">
@@ -133,6 +181,7 @@
               <button type="button" class="seg" data-ws-filter="bound">已绑定</button>
               <button type="button" class="seg" data-ws-filter="alert">异常</button>
               <button type="button" class="seg" data-ws-filter="todo">有待办</button>
+              <button type="button" class="seg" data-ws-filter="archived" id="seg-ws-archived">已归档</button>
             </div>
             <span class="select sm">
               <select id="ws-sort" aria-label="排序方式">
@@ -179,9 +228,12 @@
               <div class="detail-actions">
                 <button id="btn-copy-prompt" type="button" class="btn primary xs">复制启动词</button>
                 <button id="btn-jump-conv" type="button" class="btn ghost xs hidden">切换会话</button>
+                <button id="btn-archive-ws" type="button" class="btn ghost xs">归档</button>
                 <button id="btn-open-editor" type="button" class="btn secondary xs">在文件栏打开</button>
               </div>
             </div>
+
+            <div id="detail-sessions" class="detail-sessions hidden"></div>
 
             <div class="detail-files">
               <div id="file-core-pills" class="file-pills"></div>

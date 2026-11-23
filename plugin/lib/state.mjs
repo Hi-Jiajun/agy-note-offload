@@ -173,12 +173,13 @@ export function housekeeping(env = process.env) {
  * 计算单会话健康状态标签（OK / OK(offload) / RETRY(N) / DEAD(...)）。
  * @param {Record<string, any> | null | undefined} entry
  * @param {number} [nowSec]
+ * @param {number} [retryWindowSec]
  * @returns {string}
  */
-export function sessionHealth(entry, nowSec = Date.now() / 1000) {
+export function sessionHealth(entry, nowSec = Date.now() / 1000, retryWindowSec = RETRY_WINDOW_SEC) {
   if (!entry || typeof entry !== 'object') return 'NONE';
   const ts = Number(entry.ts || 0);
-  const within = nowSec - ts <= RETRY_WINDOW_SEC;
+  const within = nowSec - ts <= retryWindowSec;
   const tries = Number(entry.tries || 0);
   if (entry.dead && within) {
     return `DEAD(${entry.dead_reason || 'locked'})`;

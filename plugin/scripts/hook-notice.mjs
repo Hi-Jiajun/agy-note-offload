@@ -5,7 +5,7 @@
 import { closeSync, existsSync, openSync, readFileSync, readSync, statSync } from 'node:fs';
 import { join } from 'node:path';
 import { hasConfiguredAliases } from '../lib/aliases.mjs';
-import { loadConfig } from '../lib/config.mjs';
+import { loadConfig, saveConfig } from '../lib/config.mjs';
 import { detectConflicts, isActiveControlTowerController } from '../lib/conflicts.mjs';
 import { appendFlightEvent, SLOW_OP_THRESHOLD_MS } from '../lib/logger.mjs';
 import { getMapPath, getPluginRoot, shortPath } from '../lib/paths.mjs';
@@ -13,7 +13,6 @@ import { applySanitizeIfEnabled } from '../lib/sanitize.mjs';
 import {
   appendLog,
   loadState,
-  RETRY_WINDOW_SEC,
   saveState,
   withStateLock,
 } from '../lib/state.mjs';
@@ -29,6 +28,22 @@ import {
 const EXPECTED = 'PreInvocation';
 const TAIL_BYTES = 131_072;
 const RULE_REV = 2;
+
+function getPluginRuleMeta(env = process.env) {
+  let pluginVersion = '2.0.0';
+  try {
+    const meta = JSON.parse(readFileSync(join(getPluginRoot(env), 'plugin.json'), 'utf-8'));
+    if (meta && typeof meta.version === 'string' && meta.version.trim()) {
+      pluginVersion = meta.version.trim();
+    }
+  } catch {
+    // 忽略清单读取失败，使用兜底版本号
+  }
+  return {
+    pluginVersion,
+    ruleVersion: `${pluginVersion}#${RULE_REV}`,
+  };
+}
 
 const OFFLOAD_RULE =
   '[落盘模式] 本会话采用双向文件工作流：单一目标目录为 {dir}（严禁同时往多个落盘目录双写）；' +
@@ -51,6 +66,10 @@ const NUDGE_WORDS = new Set([
 const CONFIRM_WORDS = new Set([
   '确认', '确认继续', '同意', '同意继续', '继续', '继续执行',
   '好', '好的', '行', '可以', 'yes', 'y', 'ok', 'okay', 'confirm', 'continue',
+]);
+
+const PERMANENT_CONFIRM_WORDS = new Set([
+  '永久确认', '记住', '记住选择', '以后不再提示', '不再提示', 'always', 'remember',
 ]);
 
 function readStdinJson() {
@@ -151,10 +170,15 @@ function isShortNudge(text) {
 
 function isConfirmWord(text) {
   const cleaned = normalizeShortPhrase(text);
-  return Boolean(cleaned) && CONFIRM_WORDS.has(cleaned);
+  return Boolean(cleaned) && (CONFIRM_WORDS.has(cleaned) || PERMANENT_CONFIRM_WORDS.has(cleaned));
 }
 
-function buildRiskConfirmCard(conv, entry, { needsOrchConfirm, needsCtConfirm }) {
+function isPermanentConfirmWord(text) {
+  const cleaned = normalizeShortPhrase(text);
+  return Boolean(cleaned) && PERMANENT_CONFIRM_WORDS.has(cleaned);
+}
+
+function buildRiskConfirmCard(conv, entry, { needsOrchConfirm, needsCtConfirm, orchMode = 'once' }) {
   const noteDir = resolveNoteDir(conv, entry, { create: false });
   const lines = [];
   if (needsOrchConfirm && needsCtConfirm) {
@@ -168,9 +192,14 @@ function buildRiskConfirmCard(conv, entry, { needsOrchConfirm, needsCtConfirm })
   if (needsOrchConfirm) {
     lines.push('> - 当前会话运行在 `Orchestrator` 双阶段模型，规划阶段只读不可直接写盘，落盘与状态同步会移交执行模型多走一轮；');
     lines.push('> - 本插件已采用无损规划交接策略，不会压缩您的规划推理、改法与回退条件；');
+    if (orchMode === 'once') {
+      lines.push('> - 当前确认策略为 **首启一次性（`once`）**：本次确认后将全局记住，后续 `Orchestrator` 会话不再重复弹窗（可在 Sidecar 设置中心或 `agynote config` 随时调整）；');
+    } else if (orchMode === 'per_session') {
+      lines.push('> - 当前确认策略为 **每会话确认（`per_session`）**：回复 `确认` 仅放行本会话，回复 **`永久确认`** 可切换为全局记住；');
+    }
   }
   if (needsCtConfirm) {
-    lines.push('> - 当前会话为 `control-tower` 现役总控会话，开启落盘或熔断拦截可能影响总控轮询与裸会话 ID 摄入，建议总控独立保留全局台账调度，不复用子任务落盘目录；');
+    lines.push('> - 当前会话为 `control-tower` 现役总控会话（始终按会话级确认），开启落盘或熔断拦截可能影响总控轮询与裸会话 ID 摄入，建议总控独立保留全局台账调度，不复用子任务落盘目录；');
   }
   lines.push('> - 回复 **`确认`** 或 **`继续`** 将自动带原指令开启落盘模式；如需放弃或切换会话/模型，请直接发新指令。');
   return lines.join('\n');
@@ -246,6 +275,9 @@ function main() {
   const hasInputField = Object.hasOwn(payload, 'lastUserInput') && payload.lastUserInput !== null && payload.lastUserInput !== undefined;
   const lastRaw = String(payload.lastUserInput || '');
   const cfg = loadConfig(process.env);
+  const retryWindowSec = cfg.retryWindowMin * 60;
+  const maxRetry = cfg.maxRetry;
+  const { pluginVersion, ruleVersion } = getPluginRuleMeta(process.env);
   const wsPaths = [
     ...new Set(
       [
@@ -298,6 +330,7 @@ function main() {
   const curSig = hasInputField ? inputSig(lastRaw) : '';
 
   let output = null;
+  let pendingConfigPatch = null;
   const pendingLogs = [];
   const pendingFlight = [];
 
@@ -315,6 +348,7 @@ function main() {
       if (curSig) next.last_input_sig = curSig;
       delete next.alias_injected;
       delete next.rule_rev;
+      delete next.rule_version;
       delete next.pending_orch_prompt;
       delete next.pending_confirm_reasons;
       delete next.defer_alias;
@@ -384,10 +418,16 @@ function main() {
       if ((hasInputField && isConfirmWord(lastRaw)) || explicitOffload) {
         const savedPrompt = entry.pending_orch_prompt;
         const reasons = Array.isArray(entry.pending_confirm_reasons) ? entry.pending_confirm_reasons : ['orchestrator'];
+        const permanentConfirm = hasInputField && isPermanentConfirmWord(lastRaw);
         delete entry.pending_orch_prompt;
         delete entry.pending_confirm_reasons;
         if (reasons.includes('orchestrator') || isOrchestratorSession(payload)) {
           entry.orch_confirmed = true;
+          if (permanentConfirm) {
+            pendingConfigPatch = { orchestratorConfirm: 'once', orchestratorConfirmedOnce: true };
+          } else if (cfg.orchestratorConfirm === 'once' && !cfg.orchestratorConfirmedOnce) {
+            pendingConfigPatch = { orchestratorConfirmedOnce: true };
+          }
         }
         if (reasons.includes('control_tower') || isCtController) {
           entry.ct_confirmed = true;
@@ -404,8 +444,13 @@ function main() {
           if (savedSig) entry.last_input_sig = savedSig;
           replayedSavedPrompt = true;
         }
-        pendingLogs.push(`preinvocation confirm_accepted conv=${conv} reasons=${reasons.join(',')}`);
-        pendingFlight.push({ level: 'info', event: 'confirm_accepted', message: `确认开启落盘 (${reasons.join(',')})`, detail: { reasons } });
+        pendingLogs.push(`preinvocation confirm_accepted conv=${conv} reasons=${reasons.join(',')}${permanentConfirm ? ' permanent=1' : ''}`);
+        pendingFlight.push({
+          level: 'info',
+          event: 'confirm_accepted',
+          message: `确认开启落盘 (${reasons.join(',')})`,
+          detail: { reasons, permanentConfirm, orchMode: cfg.orchestratorConfirm },
+        });
       } else {
         delete entry.pending_orch_prompt;
         delete entry.pending_confirm_reasons;
@@ -420,7 +465,15 @@ function main() {
     }
 
     if (explicitOffload) {
-      const needsOrchConfirm = !entry.orch_confirmed && isOrchestratorSession(payload);
+      const isOrch = isOrchestratorSession(payload);
+      let needsOrchConfirm = false;
+      if (isOrch && !entry.orch_confirmed) {
+        if (cfg.orchestratorConfirm === 'per_session') {
+          needsOrchConfirm = true;
+        } else if (cfg.orchestratorConfirm === 'once') {
+          needsOrchConfirm = !cfg.orchestratorConfirmedOnce;
+        }
+      }
       const needsCtConfirm = !entry.ct_confirmed && isCtController;
       if (needsOrchConfirm || needsCtConfirm) {
         const reasons = [];
@@ -432,9 +485,13 @@ function main() {
         if (curSig) entry.last_input_sig = curSig;
         state[conv] = entry;
         saveState(state);
-        const card = buildRiskConfirmCard(conv, entry, { needsOrchConfirm, needsCtConfirm });
+        const card = buildRiskConfirmCard(conv, entry, {
+          needsOrchConfirm,
+          needsCtConfirm,
+          orchMode: cfg.orchestratorConfirm,
+        });
         pendingLogs.push(`preinvocation confirm_prompt conv=${conv} reasons=${reasons.join(',')}`);
-        pendingFlight.push({ level: 'info', event: 'confirm_prompt', message: `弹出零配额风险确认卡 (${reasons.join(',')})`, detail: { reasons } });
+        pendingFlight.push({ level: 'info', event: 'confirm_prompt', message: `弹出零配额风险确认卡 (${reasons.join(',')})`, detail: { reasons, orchMode: cfg.orchestratorConfirm } });
         output = {
           injectSteps: [
             {
@@ -448,11 +505,14 @@ function main() {
         };
         return;
       }
+      if (isOrch && !entry.orch_confirmed) {
+        entry.orch_confirmed = true;
+      }
       entry.offload_mode = true;
     }
 
-    const withinWindow = now - Number(entry.ts || 0) <= RETRY_WINDOW_SEC;
-    const dead = withinWindow && (Boolean(entry.dead) || Number(entry.tries || 0) > 2);
+    const withinWindow = now - Number(entry.ts || 0) <= retryWindowSec;
+    const dead = withinWindow && (Boolean(entry.dead) || Number(entry.tries || 0) > maxRetry);
     const deadReason = entry.dead_reason || 'max_retry';
 
     if (dead && !replayedSavedPrompt) {
@@ -514,14 +574,18 @@ function main() {
     }
 
     const offloadMode = Boolean(entry.offload_mode) || (withinWindow && Number(entry.tries || 0) >= 2);
-    const needsRuleInject = !entry.alias_injected || Number(entry.rule_rev || 0) < RULE_REV;
+    const needsRuleInject =
+      !entry.alias_injected ||
+      Number(entry.rule_rev || 0) < RULE_REV ||
+      entry.rule_version !== ruleVersion;
     if (offloadMode && needsRuleInject) {
       const isUpgradeRefresh = Boolean(entry.alias_injected);
       entry.alias_injected = true;
       entry.rule_rev = RULE_REV;
+      entry.rule_version = ruleVersion;
       const noteDir = resolveNoteDir(conv, entry, { create: false });
       let ruleTpl = isUpgradeRefresh
-        ? `[落盘模式规则已升级 v2] 请以以下新版规则替代本会话历史消息中的旧版落盘限制：\n${OFFLOAD_RULE}`
+        ? `[落盘模式规则已升级 v${pluginVersion}] 请以以下新版规则替代本会话历史消息中的旧版落盘限制：\n${OFFLOAD_RULE}`
         : OFFLOAD_RULE;
       if (cfg.aliasEnabled && hasConfiguredAliases(process.env)) {
         const neturlPath = shortPath(join(getPluginRoot(), 'scripts', 'neturl.mjs'));
@@ -530,12 +594,12 @@ function main() {
       }
       const rule = applySanitizeIfEnabled(ruleTpl.replaceAll('{dir}', noteDir), process.env, cfg);
       steps.push({ systemMessage: { systemMessage: rule } });
-      pendingLogs.push(`preinvocation ${isUpgradeRefresh ? 'rule_refresh' : 'alias'} conv=${conv} dir=${noteDir}`);
+      pendingLogs.push(`preinvocation ${isUpgradeRefresh ? 'rule_refresh' : 'alias'} conv=${conv} ver=${ruleVersion} dir=${noteDir}`);
       pendingFlight.push({
         level: 'info',
         event: isUpgradeRefresh ? 'rule_refresh' : 'rule_inject',
-        message: `${isUpgradeRefresh ? '升级刷新' : '注入'}落盘规则 -> ${noteDir}`,
-        detail: { noteDir, ruleRev: RULE_REV },
+        message: `${isUpgradeRefresh ? '升级刷新' : '注入'}落盘规则 (${ruleVersion}) -> ${noteDir}`,
+        detail: { noteDir, ruleRev: RULE_REV, ruleVersion },
       });
     }
 
@@ -573,6 +637,20 @@ function main() {
       output = { injectSteps: steps };
     }
   });
+
+  if (pendingConfigPatch) {
+    try {
+      saveConfig(pendingConfigPatch, process.env);
+    } catch (err) {
+      appendFlightEvent(process.env, {
+        level: 'warn',
+        source: 'hook-notice',
+        event: 'config_persist_warn',
+        conv,
+        message: err?.message || '持久化确认配置失败',
+      });
+    }
+  }
 
   const durationMs = Date.now() - t0;
   for (const line of pendingLogs) {

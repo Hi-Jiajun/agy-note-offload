@@ -4,7 +4,7 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { afterEach, describe, it } from 'node:test';
 import { upsertAlias } from '../plugin/lib/aliases.mjs';
-import { saveConfig } from '../plugin/lib/config.mjs';
+import { loadConfig, saveConfig } from '../plugin/lib/config.mjs';
 import { latinLeftovers } from '../plugin/lib/sanitize.mjs';
 import { createSandbox } from './helpers/sandbox.mjs';
 
@@ -156,7 +156,7 @@ describe('hooks 生命周期：按需零污染、Orchestrator 确认、Stop 递�
     assert.equal(runHook(RETRY, { transcriptPath: transcript, conversationId: 'offconv1' }, sb.env), '{}');
   });
 
-  it('Orchestrator 首次启用 /note-offload 触发零配额确认卡，回复确认自动补发原指令且无损交接', () => {
+  it('Orchestrator 默认首启一次性确认 (once)，支持 per_session / 永久确认 / off，且动态阈值生效', () => {
     const sb = newSandbox();
     const stateFile = join(sb.dataDir, '.filter-retry-state.json');
 
@@ -189,6 +189,43 @@ describe('hooks 生命周期：按需零污染、Orchestrator 确认、Stop 递�
     assert.equal(afterState.orch_confirmed, true);
     assert.equal(afterState.offload_mode, true);
     assert.equal(afterState.pending_orch_prompt, undefined);
+    assert.equal(loadConfig(sb.env).orchestratorConfirmedOnce, true);
+
+    // 默认 once 模式下，第二个全新 Orchestrator 会话免重复弹确认卡，直接生效
+    const secondSessionOut = JSON.parse(runHook(NOTICE, {
+      conversationId: 'orch2',
+      modelName: 'gemini-pro-orchestrator-neon',
+      lastUserInput: '/note-offload 新会话直接执行',
+    }, sb.env));
+    assert.equal(secondSessionOut.terminationBehavior, undefined);
+    assert.match(secondSessionOut.injectSteps[0].systemMessage.systemMessage, /\[落盘模式\]/);
+
+    // 切回 per_session 后再次弹窗；回复「永久确认」切回 once 并全局记住
+    saveConfig({ orchestratorConfirm: 'per_session', orchestratorConfirmedOnce: false }, sb.env);
+    const thirdCard = JSON.parse(runHook(NOTICE, {
+      conversationId: 'orch3',
+      modelName: 'gemini-pro-orchestrator-neon',
+      lastUserInput: '/note-offload 第三次测试',
+    }, sb.env));
+    assert.equal(thirdCard.terminationBehavior, 'terminate');
+    const permAccept = JSON.parse(runHook(NOTICE, {
+      conversationId: 'orch3',
+      modelName: 'gemini-pro-orchestrator-neon',
+      lastUserInput: '永久确认',
+    }, sb.env));
+    assert.equal(permAccept.terminationBehavior, undefined);
+    assert.equal(loadConfig(sb.env).orchestratorConfirm, 'once');
+    assert.equal(loadConfig(sb.env).orchestratorConfirmedOnce, true);
+
+    // 验证配置中心动态 maxRetry=1 在第 2 次受限时立即熔断
+    saveConfig({ maxRetry: 1 }, sb.env);
+    const tPath = join(sb.root, 'dyn-retry.jsonl');
+    runHook(NOTICE, { conversationId: 'dyn1', lastUserInput: '/note-offload 动态阈值测试' }, sb.env);
+    writeTranscript(tPath, [{ step_index: 2, output_tokens: 90, thinking: 'ok', content: "This request was blocked by Gemini's filters." }]);
+    assert.match(runHook(RETRY, { transcriptPath: tPath, conversationId: 'dyn1' }, sb.env), /"decision":"continue"/);
+    writeTranscript(tPath, [{ step_index: 3, output_tokens: 90, thinking: 'ok', content: "This request was blocked by Gemini's filters." }]);
+    assert.equal(runHook(RETRY, { transcriptPath: tPath, conversationId: 'dyn1' }, sb.env), '{}');
+    assert.equal(JSON.parse(readFileSync(stateFile, 'utf-8')).dyn1.dead_reason, 'max_retry');
   });
 
   it('命名工作台自动绑定、连续递增 turn-N 编号且熔断卡片优先指向 task/status/turn', () => {
@@ -339,8 +376,19 @@ describe('hooks 生命周期：按需零污染、Orchestrator 确认、Stop 递�
 
     // 重新模拟熔断，测试全新指令放行一次
     const stateFile = join(sb.dataDir, '.filter-retry-state.json');
+    const curVer = JSON.parse(readFileSync(join(PLUGIN_DIR, 'plugin.json'), 'utf-8')).version;
     writeFileSync(stateFile, JSON.stringify({
-      selftest: { step: 12, tries: 3, dead: true, offload_mode: true, alias_injected: true, rule_rev: 2, notified: false, ts: Date.now() / 1000 },
+      selftest: {
+        step: 12,
+        tries: 3,
+        dead: true,
+        offload_mode: true,
+        alias_injected: true,
+        rule_rev: 2,
+        rule_version: `${curVer}#2`,
+        notified: false,
+        ts: Date.now() / 1000,
+      },
     }));
 
     const newOut = JSON.parse(runHook(NOTICE, {
@@ -454,14 +502,24 @@ describe('hooks 生命周期：按需零污染、Orchestrator 确认、Stop 递�
     assert.equal(stAfter.ct_confirmed, true);
     assert.equal(stAfter.rule_rev, 2);
 
-    // 3. 存量旧会话（offload_mode=true, alias_injected=true 但无 rule_rev）自动触发 v2 规则刷新且不重复注入
+    // 3. 存量旧会话（无 rule_rev 或旧版本 rule_version）自动触发版本感知规则刷新且不重复注入
     const legacyConv = 'leg11223-aaaa-bbbb-cccc-ddddeeeeffff';
+    const oldVerConv = 'old21000-aaaa-bbbb-cccc-ddddeeeeffff';
     const cur = JSON.parse(readFileSync(stateFile, 'utf-8'));
     cur[legacyConv] = {
       step: 5,
       offload_mode: true,
       alias_injected: true,
       note_dir: '~/agy-notes/legacy-ws',
+      ts: Date.now() / 1000,
+    };
+    cur[oldVerConv] = {
+      step: 5,
+      offload_mode: true,
+      alias_injected: true,
+      rule_rev: 2,
+      rule_version: '2.0.0#2',
+      note_dir: '~/agy-notes/oldver-ws',
       ts: Date.now() / 1000,
     };
     writeFileSync(stateFile, JSON.stringify(cur));
@@ -471,8 +529,10 @@ describe('hooks 生命周期：按需零污染、Orchestrator 确认、Stop 递�
       initialNumSteps: 10,
       lastUserInput: '继续执行阶段 3',
     }, sb.env));
-    assert.match(refreshed.injectSteps[0].systemMessage.systemMessage, /\[落盘模式规则已升级 v2\]/);
-    assert.equal(JSON.parse(readFileSync(stateFile, 'utf-8'))[legacyConv].rule_rev, 2);
+    assert.match(refreshed.injectSteps[0].systemMessage.systemMessage, /\[落盘模式规则已升级 v[\d.]+\]/);
+    const updatedLegacy = JSON.parse(readFileSync(stateFile, 'utf-8'))[legacyConv];
+    assert.equal(updatedLegacy.rule_rev, 2);
+    assert.match(updatedLegacy.rule_version, /^[\d.]+#2$/);
 
     const secondPass = runHook(NOTICE, {
       conversationId: legacyConv,
@@ -480,5 +540,18 @@ describe('hooks 生命周期：按需零污染、Orchestrator 确认、Stop 递�
       lastUserInput: '再核对一次',
     }, sb.env);
     assert.equal(secondPass, '{}');
+
+    // 旧版本号会话在发版升级后也自动刷新一次
+    const verRefreshed = JSON.parse(runHook(NOTICE, {
+      conversationId: oldVerConv,
+      initialNumSteps: 10,
+      lastUserInput: '继续分析',
+    }, sb.env));
+    assert.match(verRefreshed.injectSteps[0].systemMessage.systemMessage, /\[落盘模式规则已升级 v[\d.]+\]/);
+    assert.equal(runHook(NOTICE, {
+      conversationId: oldVerConv,
+      initialNumSteps: 12,
+      lastUserInput: '再检查一次',
+    }, sb.env), '{}');
   });
 });

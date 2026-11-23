@@ -3,6 +3,7 @@
  * Antigravity Stop hook: 仅管理已开启落盘或非总控绑定会话，2 档续跑 + 跨轮 Plan Mode 分流 + 连续递增 turn-N + 快速熔断。
  */
 import { closeSync, existsSync, openSync, readFileSync, readSync, statSync } from 'node:fs';
+import { loadConfig } from '../lib/config.mjs';
 import { isActiveControlTowerController } from '../lib/conflicts.mjs';
 import { appendFlightEvent, SLOW_OP_THRESHOLD_MS } from '../lib/logger.mjs';
 import { applySanitizeIfEnabled } from '../lib/sanitize.mjs';
@@ -10,7 +11,6 @@ import {
   appendLog,
   housekeeping,
   loadState,
-  RETRY_WINDOW_SEC,
   saveState,
   withStateLock,
 } from '../lib/state.mjs';
@@ -25,10 +25,6 @@ import {
 
 const EXPECTED = 'Stop';
 const MARKER = 'blocked by Gemini';
-const MAX_RETRY = 2;
-const ZERO_OUT_LIMIT = 2;
-const LONG_ANSWER = 800;
-const BIG_CONTEXT = 120_000;
 const SKIP_REASONS = new Set([
   'user_canceled',
   'user_cancelled',
@@ -209,6 +205,12 @@ function main() {
 
   const rec = recs[recs.length - 1];
   const now = Date.now() / 1000;
+  const cfg = loadConfig(process.env);
+  const retryWindowSec = cfg.retryWindowMin * 60;
+  const maxRetry = cfg.maxRetry;
+  const zeroOutLimit = cfg.zeroOutLimit;
+  const longAnswerThreshold = cfg.longAnswerTokens;
+  const bigContextThreshold = cfg.bigContextTokens;
   const curStep = rec.step_index;
   const body = typeof rec.content === 'string' ? rec.content : '';
   const uInfo = extractLastUserInfo(recs);
@@ -247,7 +249,7 @@ function main() {
         message: `检测到步数回退 (${prevStep} -> ${curStep})，已重置重试计数`,
       });
       const kept = {};
-      for (const k of ['alias_injected', 'offload_mode', 'note_dir', 'orch_confirmed', 'ct_confirmed', 'conflict_warned', 'rule_rev']) {
+      for (const k of ['alias_injected', 'offload_mode', 'note_dir', 'orch_confirmed', 'ct_confirmed', 'conflict_warned', 'rule_rev', 'rule_version']) {
         if (entry[k]) kept[k] = entry[k];
       }
       entry = kept;
@@ -287,7 +289,7 @@ function main() {
         }
         entryKeep.step = curStep;
         entryKeep.ts = now;
-        if (entryKeep.alias_injected || entryKeep.offload_mode || entryKeep.note_dir || entryKeep.orch_confirmed || entryKeep.ct_confirmed || entryKeep.rule_rev) {
+        if (entryKeep.alias_injected || entryKeep.offload_mode || entryKeep.note_dir || entryKeep.orch_confirmed || entryKeep.ct_confirmed || entryKeep.rule_rev || entryKeep.rule_version) {
           state[conv] = entryKeep;
         } else {
           delete state[conv];
@@ -297,7 +299,7 @@ function main() {
       return;
     }
 
-    const withinWindow = !rewound && (now - Number(entry.ts || 0) <= RETRY_WINDOW_SEC);
+    const withinWindow = !rewound && (now - Number(entry.ts || 0) <= retryWindowSec);
     const zeroOut = isZeroOutputBlock(rec);
     let tries;
     let zeroStreak;
@@ -310,7 +312,7 @@ function main() {
     }
 
     const preserved = {};
-    for (const k of ['alias_injected', 'offload_mode', 'note_dir', 'last_input_sig', 'orch_confirmed', 'ct_confirmed', 'conflict_warned', 'rule_rev']) {
+    for (const k of ['alias_injected', 'offload_mode', 'note_dir', 'last_input_sig', 'orch_confirmed', 'ct_confirmed', 'conflict_warned', 'rule_rev', 'rule_version']) {
       if (entry[k]) preserved[k] = entry[k];
     }
 
@@ -325,7 +327,7 @@ function main() {
     entry.zero_streak = zeroStreak;
     entry.ts = now;
 
-    if (zeroStreak >= ZERO_OUT_LIMIT) {
+    if (zeroStreak >= zeroOutLimit) {
       delete entry.defer_alias;
       entry.dead = true;
       entry.dead_reason = 'context_locked';
@@ -344,7 +346,7 @@ function main() {
       return;
     }
 
-    if (tries > MAX_RETRY) {
+    if (tries > maxRetry) {
       delete entry.defer_alias;
       entry.dead = true;
       entry.dead_reason = 'max_retry';
@@ -364,9 +366,9 @@ function main() {
     }
 
     const planMode = isPlanMode(rec, recs);
-    const longAnswer = Number(rec.output_tokens || 0) >= LONG_ANSWER;
+    const longAnswer = Number(rec.output_tokens || 0) >= longAnswerThreshold;
     const totalCtx = Number(rec.input_tokens || 0) + Number(rec.cache_read_tokens || 0);
-    const bigCtx = totalCtx >= BIG_CONTEXT;
+    const bigCtx = totalCtx >= bigContextThreshold;
 
     let tier;
     let reasonTpl;

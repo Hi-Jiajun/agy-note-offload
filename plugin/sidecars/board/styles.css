@@ -869,6 +869,82 @@ code, pre, .mono-path, .textarea.code, .log-box, .code-inline {
   color: var(--no-fg-muted);
 }
 
+.settings-thresholds {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding-top: 8px;
+  border-top: 1px solid var(--no-line);
+}
+
+.settings-subhead {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.threshold-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 6px;
+}
+
+.threshold-field {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  font-size: var(--text-2xs);
+  color: var(--no-fg-muted);
+  min-width: 0;
+}
+
+.input.xs {
+  height: 26px;
+  padding: 0 7px;
+  font-size: var(--text-2xs);
+}
+
+.settings-actions {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 6px;
+}
+
+.detail-sessions {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 5px;
+  font-size: var(--text-2xs);
+}
+
+.session-chip {
+  appearance: none;
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 2px 6px;
+  border-radius: var(--r-md);
+  border: 1px solid var(--no-line);
+  background: var(--no-field);
+  color: var(--no-fg-2);
+  font-size: var(--text-2xs);
+  transition: background-color 0.12s ease, border-color 0.12s ease;
+}
+
+.session-chip:hover {
+  background: var(--no-hover);
+  border-color: var(--no-card-border);
+}
+
+.session-chip.is-current {
+  border-color: var(--no-primary-border);
+  background: var(--no-primary-bg);
+}
+
 .env-grid {
   display: grid;
   grid-template-columns: 1fr 1fr;
@@ -1711,7 +1787,7 @@ code, pre, .mono-path, .textarea.code, .log-box, .code-inline {
 }
 
 @media (max-width: 460px) {
-  .grid-2, .env-grid {
+  .grid-2, .env-grid, .threshold-grid {
     grid-template-columns: 1fr;
   }
 }

@@ -250,9 +250,14 @@ describe('Sidecar 后端契约（实测 sidecar_sdk）与前端安全检查', ()
       const cfgRes = JSON.parse((await reqJson(base, token, 'POST', '/api/config/update', {
         sanitizeEnabled: true,
         aliasEnabled: true,
+        maxRetry: 4,
+        orchestratorConfirm: 'per_session',
       })).text);
       assert.equal(cfgRes.ok, true);
-      assert.deepEqual(cfgRes.config, { sanitizeEnabled: true, aliasEnabled: true });
+      assert.equal(cfgRes.config.sanitizeEnabled, true);
+      assert.equal(cfgRes.config.aliasEnabled, true);
+      assert.equal(cfgRes.config.maxRetry, 4);
+      assert.equal(cfgRes.config.orchestratorConfirm, 'per_session');
       assert.equal(cfgRes.conflicts.some((c) => c.code === 'alias_hex8_control_tower'), true);
 
       const delAlias = await reqJson(base, token, 'POST', '/api/alias/delete', { key: 'deadbeef' });
@@ -270,6 +275,12 @@ describe('Sidecar 后端契约（实测 sidecar_sdk）与前端安全检查', ()
             note_dir: '~/agy-notes/ws1',
             ts: Date.now() / 1000,
           },
+          histconv5678: {
+            step: 5,
+            offload_mode: true,
+            note_dir: '~/agy-notes/ws1',
+            ts: Date.now() / 1000 - 300,
+          },
         }),
       );
       const snap1 = JSON.parse((await reqJson(base, token, 'POST', '/api/snapshot', {})).text);
@@ -281,12 +292,40 @@ describe('Sidecar 后端契约（实测 sidecar_sdk）与前端安全检查', ()
       assert.equal(snap1.workspaces[0].latestTurn, 3);
       assert.equal(snap1.workspaces[0].latestTurnFile, 'turn-3.md');
       assert.equal(snap1.workspaces[0].isEmpty, false);
+      assert.equal(snap1.workspaces[0].sessionCount, 2);
+      assert.equal(snap1.workspaces[0].boundSessions.length, 2);
       assert.equal(snap1.hasRealAliases, true);
       assert.equal(snap1.aliasesIsExample, false);
       assert.equal(snap1.trackedSessions[0].dead, true);
       assert.equal(snap1.trackedSessions[0].wsName, 'ws1');
       assert.equal(snap1.trackedSessions[0].withinWindow, true);
-      assert.deepEqual(snap1.config, { sanitizeEnabled: true, aliasEnabled: true });
+      assert.equal(snap1.config.sanitizeEnabled, true);
+      assert.equal(snap1.config.aliasEnabled, true);
+      assert.equal(snap1.config.maxRetry, 4);
+
+      // 二次无变更轮询命中 mtimeMs 缓存
+      const snapCached = JSON.parse((await reqJson(base, token, 'POST', '/api/snapshot', {})).text);
+      assert.equal(snapCached.cacheStats.hits >= 1, true);
+
+      // 逻辑归档与取消归档（不移动磁盘目录）
+      const archRes = JSON.parse((await reqJson(base, token, 'POST', '/api/workspace/archive', {
+        workspace: 'ws1',
+        archived: true,
+      })).text);
+      assert.equal(archRes.ok, true);
+      assert.equal(archRes.moved, false);
+      const snapArch = JSON.parse((await reqJson(base, token, 'POST', '/api/snapshot', {})).text);
+      assert.equal(snapArch.archivedCount, 1);
+      assert.equal(snapArch.workspaces[0].archived, true);
+
+      await reqJson(base, token, 'POST', '/api/workspace/archive', { workspace: 'ws1', archived: false });
+
+      // 一键重置配置中心默认
+      const resetCfgRes = JSON.parse((await reqJson(base, token, 'POST', '/api/config/reset', {})).text);
+      assert.equal(resetCfgRes.ok, true);
+      assert.equal(resetCfgRes.config.maxRetry, 2);
+      assert.equal(resetCfgRes.config.orchestratorConfirm, 'once');
+      assert.equal(resetCfgRes.config.sanitizeEnabled, false);
 
       assert.equal((await reqJson(base, token, 'POST', '/api/state/reset', { conversationId: 'deadconv1234' })).status, 200);
       const snap2 = JSON.parse((await reqJson(base, token, 'POST', '/api/snapshot', {})).text);

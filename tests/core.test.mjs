@@ -6,7 +6,8 @@ import { join, resolve } from 'node:path';
 import { afterEach, describe, it } from 'node:test';
 import { promisify } from 'node:util';
 import { addAliasStrict, hasConfiguredAliases, upsertAlias } from '../plugin/lib/aliases.mjs';
-import { loadConfig, saveConfig } from '../plugin/lib/config.mjs';
+import { archiveWorkspace, loadArchivedMap, unarchiveWorkspace } from '../plugin/lib/archive.mjs';
+import { DEFAULT_CONFIG, loadConfig, resetConfig, saveConfig } from '../plugin/lib/config.mjs';
 import { detectConflicts, isActiveControlTowerController } from '../plugin/lib/conflicts.mjs';
 import { withFileLockSync } from '../plugin/lib/lock.mjs';
 import { ensureDataDir, getDataDir, getPluginRoot, getStatePath, shortPath } from '../plugin/lib/paths.mjs';
@@ -91,16 +92,61 @@ describe('core 共享内核：路径隔离、配置可选项、冲突检测、�
     assert.equal(st.realconv1?.note_dir, '~/agy-notes/ws1');
   });
 
-  it('config.mjs 默认关闭可选项，支持锁写入及环境变量覆盖', () => {
+  it('config.mjs 完整配置中心默认值、边界校验、锁写入、一键重置与环境变量覆盖', () => {
     const sb = newSandbox();
-    assert.deepEqual(loadConfig(sb.env), { sanitizeEnabled: false, aliasEnabled: false });
+    assert.deepEqual(loadConfig(sb.env), DEFAULT_CONFIG);
 
-    const saved = saveConfig({ aliasEnabled: true }, sb.env);
-    assert.deepEqual(saved, { sanitizeEnabled: false, aliasEnabled: true });
-    assert.deepEqual(loadConfig(sb.env), { sanitizeEnabled: false, aliasEnabled: true });
+    const saved = saveConfig({ aliasEnabled: true, maxRetry: 4, orchestratorConfirm: 'per_session' }, sb.env);
+    assert.equal(saved.aliasEnabled, true);
+    assert.equal(saved.maxRetry, 4);
+    assert.equal(saved.orchestratorConfirm, 'per_session');
+    assert.equal(loadConfig(sb.env).maxRetry, 4);
 
-    const overridden = loadConfig({ ...sb.env, AGY_OFFLOAD_SANITIZE: 'on', AGY_OFFLOAD_ALIAS: 'off' });
-    assert.deepEqual(overridden, { sanitizeEnabled: true, aliasEnabled: false });
+    assert.throws(() => saveConfig({ maxRetry: 99 }, sb.env), /1 到 5/);
+    assert.throws(() => saveConfig({ orchestratorConfirm: 'invalid' }, sb.env), /orchestratorConfirm/);
+
+    const overridden = loadConfig({
+      ...sb.env,
+      AGY_OFFLOAD_SANITIZE: 'on',
+      AGY_OFFLOAD_ALIAS: 'off',
+      AGY_OFFLOAD_ORCH_CONFIRM: 'off',
+    });
+    assert.equal(overridden.sanitizeEnabled, true);
+    assert.equal(overridden.aliasEnabled, false);
+    assert.equal(overridden.orchestratorConfirm, 'off');
+
+    const reset = resetConfig(sb.env);
+    assert.deepEqual(reset, DEFAULT_CONFIG);
+    assert.deepEqual(loadConfig(sb.env), DEFAULT_CONFIG);
+  });
+
+  it('archive.mjs 支持默认逻辑归档（不移磁盘不断链）与 --move 物理归档及无损恢复', () => {
+    const sb = newSandbox();
+    const ws1 = join(sb.noteRoot, 'ws-logical');
+    const ws2 = join(sb.noteRoot, 'ws-physical');
+    mkdirSync(ws1, { recursive: true });
+    mkdirSync(ws2, { recursive: true });
+    writeFileSync(join(ws1, 'status.md'), '# ok\n', 'utf-8');
+    writeFileSync(join(ws2, 'status.md'), '# ok\n', 'utf-8');
+
+    const logRes = archiveWorkspace('ws-logical', { move: false, env: sb.env });
+    assert.equal(logRes.moved, false);
+    assert.equal(existsSync(ws1), true, '逻辑归档必须保留原目录不断历史链接');
+    assert.equal(Boolean(loadArchivedMap(sb.env)['ws-logical']), true);
+
+    unarchiveWorkspace('ws-logical', { env: sb.env });
+    assert.equal(Boolean(loadArchivedMap(sb.env)['ws-logical']), false);
+
+    const physRes = archiveWorkspace('ws-physical', { move: true, env: sb.env });
+    assert.equal(physRes.moved, true);
+    assert.equal(existsSync(ws2), false);
+    assert.equal(existsSync(join(sb.noteRoot, '_archive', 'ws-physical', 'status.md')), true);
+    assert.equal(loadArchivedMap(sb.env)['ws-physical']?.moved, true);
+
+    const restoreRes = unarchiveWorkspace('ws-physical', { env: sb.env });
+    assert.equal(restoreRes.restoredFromMove, true);
+    assert.equal(existsSync(join(ws2, 'status.md')), true);
+    assert.equal(existsSync(join(sb.noteRoot, '_archive', 'ws-physical')), false);
   });
 
   it('文件锁自动清理已退出 PID 的死锁残留', () => {

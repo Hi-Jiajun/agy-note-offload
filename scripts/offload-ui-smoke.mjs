@@ -351,22 +351,28 @@ export async function runUiSmoke({ requireBrowser = false } = {}) {
 
     const checks = [];
 
-    // 2) 检查设置面板版本显示与窄栏无溢出
+    // 2) 检查设置中心版本显示、新阈值控件与窄栏无溢出
     await cdp.evaluate(`document.getElementById('btn-settings')?.click()`);
     await new Promise((r) => setTimeout(r, 80));
     const versionText = await cdp.evaluate(`document.getElementById('settings-version')?.textContent?.trim()`);
     assert.equal(versionText, `v${pluginMeta.version}`);
+    const orchPolicy = await cdp.evaluate(`document.getElementById('opt-orch-confirm')?.value`);
+    assert.equal(orchPolicy, 'once');
     const settingsOverflow = await cdp.evaluate(`document.documentElement.scrollWidth <= window.innerWidth + 2`);
     assert.equal(settingsOverflow, true, 'Settings drawer overflow in 390px narrow view');
     await cdp.evaluate(`document.getElementById('btn-close-settings')?.click()`);
     checks.push('narrow-dark:settings');
 
-    // 3) 点击进入工作台详情页并切换 diff 文件验证富渲染与零溢出
+    // 3) 点击进入工作台详情页验证多会话栏、归档按钮与零溢出
     await cdp.evaluate(`document.querySelector('.ws-card[data-ws="smoke-ws"]')?.click()`);
     await waitForCondition(
       async () => Boolean(await cdp.evaluate(`!document.getElementById('ws-detail-view')?.classList.contains('hidden')`)),
       { label: 'Workspace detail open' },
     );
+    const hasSessionChips = await cdp.evaluate(`document.querySelectorAll('#detail-sessions .session-chip').length >= 1`);
+    assert.equal(hasSessionChips, true, 'Expected bound session chip in detail header');
+    const hasArchiveBtn = await cdp.evaluate(`Boolean(document.getElementById('btn-archive-ws'))`);
+    assert.equal(hasArchiveBtn, true, 'Expected archive button in detail header');
     const detailOverflow = await cdp.evaluate(`document.documentElement.scrollWidth <= window.innerWidth + 2`);
     assert.equal(detailOverflow, true, 'Detail view overflow in 390px narrow view');
     await cdp.evaluate(`document.getElementById('btn-back')?.click()`);

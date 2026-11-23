@@ -61,6 +61,8 @@ const state = {
   diagEvents: [],
   diagConfirmClear: false,
   diagConfirmTimer: null,
+  resetSettingsConfirm: false,
+  resetSettingsTimer: null,
   configSaving: false,
   toastTimer: null,
   lastViewSig: '',
@@ -271,6 +273,7 @@ const state = {
       hasRealAliases: snap.hasRealAliases,
       aliasesIsExample: snap.aliasesIsExample,
       emptyWorkspaceCount: snap.emptyWorkspaceCount,
+      archivedCount: snap.archivedCount,
       conflicts: snap.conflicts,
       workspaces: snap.workspaces.map((w) => [
         w.name,
@@ -280,6 +283,8 @@ const state = {
         w.fileCount,
         w.summary,
         w.boundConvId,
+        w.sessionCount,
+        w.archived,
         w.taskProgress,
         w.turnCount,
         w.latestTurn,
@@ -300,30 +305,81 @@ const state = {
   }
 
   function renderHeaderAndSettings(snap) {
+    const activeWsCount = (snap.workspaces || []).filter((w) => !w.archived).length;
+    const archivedCount = Number(snap.archivedCount ?? (snap.workspaces || []).filter((w) => w.archived).length);
     const deadCount = snap.trackedSessions.filter((s) => s.dead).length;
     const summaryEl = $('top-summary');
     summaryEl.textContent = deadCount
-      ? `${snap.workspaces.length} 工作台 / ${deadCount} 熔断`
-      : `${snap.workspaces.length} 工作台`;
+      ? `${activeWsCount} 工作台 / ${deadCount} 熔断`
+      : `${activeWsCount} 工作台`;
     summaryEl.classList.toggle('has-alert', deadCount > 0);
 
     $('settings-version').textContent = snap.version ? `v${snap.version}` : '';
     $('settings-version').classList.toggle('hidden', !snap.version);
 
-    $('tab-count-workspaces').textContent = snap.workspaces.length ? String(snap.workspaces.length) : '';
+    $('tab-count-workspaces').textContent = activeWsCount ? String(activeWsCount) : '';
+    $('seg-ws-archived').textContent = archivedCount > 0 ? `已归档 (${archivedCount})` : '已归档';
     $('tab-count-aliases').textContent = snap.aliases.length ? String(snap.aliases.length) : '';
     const alertSessions = snap.trackedSessions.filter((s) => s.dead || s.tries > 0).length;
     $('tab-count-monitor').textContent = alertSessions
       ? String(alertSessions)
       : (snap.trackedSessions.length ? String(snap.trackedSessions.length) : '');
 
-    const cfg = snap.config || { sanitizeEnabled: false, aliasEnabled: false };
+    const cfg = snap.config || {
+      sanitizeEnabled: false,
+      aliasEnabled: false,
+      orchestratorConfirm: 'once',
+      orchestratorConfirmedOnce: false,
+      maxRetry: 2,
+      retryWindowMin: 15,
+      zeroOutLimit: 2,
+      longAnswerTokens: 800,
+      bigContextTokens: 120000,
+    };
     $('opt-sanitize').checked = Boolean(cfg.sanitizeEnabled);
     $('opt-alias').checked = Boolean(cfg.aliasEnabled);
     $('opt-alias-inline').checked = Boolean(cfg.aliasEnabled);
     $('opt-sanitize').disabled = state.configSaving;
     $('opt-alias').disabled = state.configSaving;
     $('opt-alias-inline').disabled = state.configSaving;
+
+    const orchSel = $('opt-orch-confirm');
+    orchSel.value = cfg.orchestratorConfirm || 'once';
+    orchSel.disabled = state.configSaving;
+    const orchStatus = $('orch-once-status');
+    const resetOrchBtn = $('btn-reset-orch-once');
+    if (cfg.orchestratorConfirm === 'once') {
+      orchStatus.textContent = cfg.orchestratorConfirmedOnce
+        ? '已全局记住首次确认（后续 Orchestrator 免重复弹窗）'
+        : '首次在 Orchestrator 启用时确认一次后全局记住';
+      resetOrchBtn.classList.toggle('hidden', !cfg.orchestratorConfirmedOnce);
+    } else if (cfg.orchestratorConfirm === 'per_session') {
+      orchStatus.textContent = '每个 Orchestrator 新会话首次启用时确认（总控始终按会话确认）';
+      resetOrchBtn.classList.add('hidden');
+    } else {
+      orchStatus.textContent = '已关闭 Orchestrator 确认卡（control-tower 总控仍受保护）';
+      resetOrchBtn.classList.add('hidden');
+    }
+
+    const numBindings = [
+      ['opt-max-retry', cfg.maxRetry],
+      ['opt-retry-window', cfg.retryWindowMin],
+      ['opt-zero-limit', cfg.zeroOutLimit],
+      ['opt-long-tokens', cfg.longAnswerTokens],
+      ['opt-big-ctx', cfg.bigContextTokens],
+    ];
+    for (const [id, val] of numBindings) {
+      const inp = $(id);
+      if (inp && document.activeElement !== inp) {
+        inp.value = String(val ?? '');
+      }
+      if (inp) inp.disabled = state.configSaving;
+    }
+    $('btn-save-settings').disabled = state.configSaving;
+    const resetBtn = $('btn-reset-settings');
+    resetBtn.disabled = state.configSaving;
+    resetBtn.textContent = state.resetSettingsConfirm ? '确认恢复默认?' : '恢复默认';
+    resetBtn.className = state.resetSettingsConfirm ? 'btn danger xs' : 'btn ghost xs';
 
     $('env-note-root').textContent = snap.noteRoot || '~/agy-notes';
     $('env-data-dir').textContent = snap.dataDir || 'plugin_data/note-offload';
@@ -405,7 +461,13 @@ const state = {
         tags.push(`<span class="tag-pill muted tabular">turn-${latestTurn}</span>`);
       }
       if (w.boundConvShort) {
-        tags.push(`<span class="tag-pill muted tabular">会话 ${esc(w.boundConvShort)}</span>`);
+        const sessLabel = Number(w.sessionCount || 0) > 1
+          ? `会话 ${esc(w.boundConvShort)} (+${w.sessionCount - 1})`
+          : `会话 ${esc(w.boundConvShort)}`;
+        tags.push(`<span class="tag-pill muted tabular">${sessLabel}</span>`);
+      }
+      if (w.archived) {
+        tags.push('<span class="tag-pill warn">已归档</span>');
       }
 
       const metaParts = [`${w.fileCount} 文件`];
@@ -478,6 +540,33 @@ const state = {
       jumpBtn.onclick = () => jumpToConversation(ws.boundConvId);
     } else {
       jumpBtn.classList.add('hidden');
+    }
+
+    const archBtn = $('btn-archive-ws');
+    archBtn.textContent = ws.archived ? '取消归档' : '归档';
+
+    const sessionsWrap = $('detail-sessions');
+    const boundList = Array.isArray(ws.boundSessions) ? ws.boundSessions : [];
+    if (boundList.length > 0) {
+      sessionsWrap.classList.remove('hidden');
+      sessionsWrap.innerHTML =
+        `<span class="muted">关联会话 (${boundList.length})</span>` +
+        boundList.map((s) => {
+          const isCur = Boolean(activeConv && s.convId === activeConv);
+          const stepTxt = s.step != null ? ` #${s.step}` : '';
+          return (
+            `<button type="button" class="session-chip${isCur ? ' is-current' : ''}" data-conv="${esc(s.convId)}" title="点击切换或复制会话 ID">` +
+              `<span class="tabular">${esc(s.convShort)}${esc(stepTxt)}</span>` +
+              `<span class="badge ${badgeClass(s.health)}">${esc(s.health)}</span>` +
+            '</button>'
+          );
+        }).join('');
+      for (const chip of sessionsWrap.querySelectorAll('.session-chip')) {
+        chip.addEventListener('click', () => jumpToConversation(chip.dataset.conv));
+      }
+    } else {
+      sessionsWrap.classList.add('hidden');
+      sessionsWrap.innerHTML = '';
     }
 
     const { core, more } = splitWorkspaceFiles(ws);
@@ -1353,6 +1442,22 @@ const state = {
     showToast(ok ? '已复制接力启动词' : '复制失败', !ok);
   });
 
+  $('btn-archive-ws').addEventListener('click', async () => {
+    const ws = state.snap?.workspaces.find((w) => w.name === state.selectedWs);
+    if (!ws) return;
+    const nextArchived = !ws.archived;
+    try {
+      await apiPost('/api/workspace/archive', {
+        workspace: ws.name,
+        archived: nextArchived,
+      });
+      showToast(nextArchived ? `已逻辑归档 ${ws.name}（保留磁盘目录不断链）` : `已恢复工作台 ${ws.name}`);
+      await refreshAll(false);
+    } catch (err) {
+      showToast(err.message || '归档操作失败', true);
+    }
+  });
+
   $('btn-open-editor').addEventListener('click', () => {
     const abs = state.fileMeta?.absPath;
     if (!abs) return;
@@ -1535,6 +1640,62 @@ const state = {
 
   $('opt-alias-inline').addEventListener('change', (e) => {
     void updateConfigOption({ aliasEnabled: Boolean(e.target.checked) });
+  });
+
+  $('opt-orch-confirm').addEventListener('change', (e) => {
+    void updateConfigOption({ orchestratorConfirm: e.target.value });
+  });
+
+  $('btn-reset-orch-once').addEventListener('click', () => {
+    void updateConfigOption({ orchestratorConfirmedOnce: false });
+  });
+
+  $('btn-save-settings').addEventListener('click', () => {
+    const patch = {
+      maxRetry: Number.parseInt($('opt-max-retry').value, 10),
+      retryWindowMin: Number.parseInt($('opt-retry-window').value, 10),
+      zeroOutLimit: Number.parseInt($('opt-zero-limit').value, 10),
+      longAnswerTokens: Number.parseInt($('opt-long-tokens').value, 10),
+      bigContextTokens: Number.parseInt($('opt-big-ctx').value, 10),
+    };
+    for (const [k, v] of Object.entries(patch)) {
+      if (!Number.isInteger(v)) {
+        showToast(`参数 ${k} 必须为有效整数`, true);
+        return;
+      }
+    }
+    void updateConfigOption(patch);
+  });
+
+  $('btn-reset-settings').addEventListener('click', async () => {
+    if (!state.resetSettingsConfirm) {
+      state.resetSettingsConfirm = true;
+      clearTimeout(state.resetSettingsTimer);
+      state.resetSettingsTimer = setTimeout(() => {
+        state.resetSettingsConfirm = false;
+        if (state.snap) renderHeaderAndSettings(state.snap);
+      }, 3000);
+      if (state.snap) renderHeaderAndSettings(state.snap);
+      return;
+    }
+    clearTimeout(state.resetSettingsTimer);
+    state.resetSettingsConfirm = false;
+    state.configSaving = true;
+    try {
+      const conv = window.sidecar?.conversationId || '';
+      const res = await apiPost('/api/config/reset', conv ? { conversationId: conv } : {});
+      if (state.snap) {
+        state.snap.config = res.config;
+        state.snap.conflicts = res.conflicts || [];
+      }
+      showToast('已一键恢复全部内置默认配置');
+    } catch (err) {
+      showToast(err.message || '恢复默认配置失败', true);
+    } finally {
+      state.configSaving = false;
+      if (state.snap) renderHeaderAndSettings(state.snap);
+      await refreshAll(false);
+    }
   });
 
   // 事件绑定：监控日志工具栏

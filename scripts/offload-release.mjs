@@ -4,7 +4,7 @@
  * 在 <PLUGIN_DATA>/releases/ 中保留最近 3 份运行态快照，支持受控实装与秒级回滚。
  */
 import { execFileSync, spawnSync } from 'node:child_process';
-import { chmodSync, cpSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, cpSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { appendFlightEvent } from '../plugin/lib/logger.mjs';
@@ -49,22 +49,45 @@ export function listSnapshots({ env = process.env, dataDir = '' } = {}) {
       const dir = join(relDir, e.name);
       const manifest = readJsonSafe(join(dir, 'manifest.json'), {});
       const pluginJson = readJsonSafe(join(dir, 'plugin', 'plugin.json'), {});
+      let mtimeMs = 0;
+      try {
+        mtimeMs = statSync(dir).mtimeMs;
+      } catch {
+        mtimeMs = 0;
+      }
+      const createdAtMs = Number.isFinite(manifest.createdAtMs)
+        ? manifest.createdAtMs
+        : (Date.parse(manifest.createdAt || '') || mtimeMs);
       return {
         name: e.name,
         dir,
         pluginDir: join(dir, 'plugin'),
         version: manifest.version || pluginJson.version || 'unknown',
         createdAt: manifest.createdAt || '',
+        createdAtMs,
         fileCount: manifest.fileCount || 0,
       };
     })
-    .sort((a, b) => b.name.localeCompare(a.name));
+    .sort((a, b) => (b.createdAtMs - a.createdAtMs) || b.name.localeCompare(a.name));
 }
 
-export function pruneSnapshots({ env = process.env, dataDir = '', keep = MAX_RELEASE_SNAPSHOTS } = {}) {
+export function pruneSnapshots({ env = process.env, dataDir = '', keep = MAX_RELEASE_SNAPSHOTS, protectName = '' } = {}) {
   const snaps = listSnapshots({ env, dataDir });
+  const cap = Math.max(1, keep);
+  const kept = [];
+  const toRemove = [];
+  for (const s of snaps) {
+    if (protectName && s.name === protectName) {
+      kept.push(s);
+    }
+  }
+  for (const s of snaps) {
+    if (protectName && s.name === protectName) continue;
+    if (kept.length < cap) kept.push(s);
+    else toRemove.push(s);
+  }
   const removed = [];
-  for (const old of snaps.slice(Math.max(1, keep))) {
+  for (const old of toRemove) {
     rmSync(old.dir, { recursive: true, force: true });
     removed.push(old.name);
   }
@@ -87,7 +110,9 @@ export function createSnapshot({
   }
 
   const version = String(installedMeta.version || '0.0.0').replace(/[^0-9A-Za-z._-]/g, '');
-  const stamp = new Date().toISOString().replace(/[-:]/g, '').replace(/\.\d+Z$/, 'Z');
+  const nowMs = Date.now();
+  const createdAt = new Date(nowMs).toISOString();
+  const stamp = createdAt.replace(/[-:.]/g, '');
   const unique = tagSuffix ? `-${String(tagSuffix).replace(/[^0-9A-Za-z_-]/g, '')}` : `-${Math.random().toString(16).slice(2, 6)}`;
   const snapName = `${stamp}-v${version}${unique}`;
   const snapDir = join(getReleasesDir(resolvedDataDir), snapName);
@@ -99,12 +124,13 @@ export function createSnapshot({
   const manifest = {
     name: snapName,
     version,
-    createdAt: new Date().toISOString(),
+    createdAt,
+    createdAtMs: nowMs,
     fileCount,
   };
   writeFileSync(join(snapDir, 'manifest.json'), `${JSON.stringify(manifest, null, 2)}\n`, 'utf-8');
 
-  const pruned = pruneSnapshots({ env, dataDir: resolvedDataDir, keep });
+  const pruned = pruneSnapshots({ env, dataDir: resolvedDataDir, keep, protectName: snapName });
   appendFlightEvent(resolvedDataDir, {
     level: 'info',
     source: 'release',

@@ -13,7 +13,8 @@ import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { Response, SidecarApp } from 'sidecar_sdk';
 import { deleteAlias, hasConfiguredAliases, readAliases, upsertAlias } from '../../lib/aliases.mjs';
-import { loadConfig, saveConfig } from '../../lib/config.mjs';
+import { archiveWorkspace, loadArchivedMap, unarchiveWorkspace } from '../../lib/archive.mjs';
+import { loadConfig, resetConfig, saveConfig } from '../../lib/config.mjs';
 import { detectConflicts } from '../../lib/conflicts.mjs';
 import { atomicWriteSync } from '../../lib/lock.mjs';
 import {
@@ -29,7 +30,6 @@ import {
   loadState,
   readLogs,
   resetConvState,
-  RETRY_WINDOW_SEC,
   sessionHealth,
 } from '../../lib/state.mjs';
 import {
@@ -39,6 +39,7 @@ import {
   formatNow,
   isConfirmEditableFile,
   readStatusSummary,
+  RESERVED_WS_NAMES,
   resolveWorkspaceDir,
   resolveWorkspaceFile,
   sortWorkspaceFiles,
@@ -151,12 +152,104 @@ function isDirEmpty(dirPath) {
   }
 }
 
+const wsScanCache = new Map();
+
+function fileSig(filePath) {
+  try {
+    const st = statSync(filePath);
+    return st.isFile() ? `${Math.round(st.mtimeMs)}:${st.size}` : '';
+  } catch {
+    return '';
+  }
+}
+
+function scanWorkspaceCached(wsDir, dirStat) {
+  const dirMtimeMs = Math.round(dirStat.mtimeMs);
+  const cached = wsScanCache.get(wsDir);
+
+  let files;
+  let empty;
+  let turnInfo;
+  let cacheHit = false;
+
+  if (cached && cached.dirMtimeMs === dirMtimeMs) {
+    files = cached.files;
+    empty = cached.empty;
+    turnInfo = cached.turnInfo;
+    cacheHit = true;
+  } else {
+    empty = isDirEmpty(wsDir);
+    let rawFiles = [];
+    try {
+      rawFiles = readdirSync(wsDir, { withFileTypes: true })
+        .filter((f) => f.isFile() && FILE_NAME_RE.test(f.name))
+        .map((f) => f.name);
+    } catch {
+      rawFiles = [];
+    }
+    files = sortWorkspaceFiles(rawFiles);
+    turnInfo = summarizeTurns(files);
+  }
+
+  const hasTask = files.includes('task.md');
+  const hasStatus = files.includes('status.md');
+  const taskSig = hasTask ? fileSig(join(wsDir, 'task.md')) : '';
+  const statusSig = hasStatus ? fileSig(join(wsDir, 'status.md')) : '';
+
+  const taskProgress = (cacheHit && cached.taskSig === taskSig)
+    ? cached.taskProgress
+    : (hasTask ? readTaskProgress(wsDir) : { done: 0, total: 0 });
+  const summary = (cacheHit && cached.statusSig === statusSig)
+    ? cached.summary
+    : (hasStatus ? readStatusSummary(wsDir, 120) : '');
+
+  let latestMtimeMs = dirStat.mtimeMs;
+  if (cacheHit && cached.taskSig === taskSig && cached.statusSig === statusSig) {
+    latestMtimeMs = cached.latestMtimeMs;
+    if (turnInfo.latestTurnFile) {
+      try {
+        const tm = statSync(join(wsDir, turnInfo.latestTurnFile)).mtimeMs;
+        if (tm > latestMtimeMs) latestMtimeMs = tm;
+      } catch {
+        // 忽略瞬时读写误差
+      }
+    }
+  } else {
+    for (const f of files) {
+      try {
+        const mst = statSync(join(wsDir, f)).mtimeMs;
+        if (mst > latestMtimeMs) latestMtimeMs = mst;
+      } catch {
+        // 忽略瞬时读写误差
+      }
+    }
+  }
+
+  const record = {
+    dirMtimeMs,
+    files,
+    empty,
+    hasTask,
+    hasStatus,
+    turnInfo,
+    taskSig,
+    statusSig,
+    taskProgress,
+    summary,
+    latestMtimeMs,
+  };
+  wsScanCache.set(wsDir, record);
+  return { ...record, cacheHit };
+}
+
 function buildSnapshot(activeConvId) {
   const nowSec = Date.now() / 1000;
   const noteRoot = getNoteRoot();
   const noteRootShort = shortPath(noteRoot);
   const state = loadState();
   const cfg = loadConfig(process.env);
+  const retryWindowSec = cfg.retryWindowMin * 60;
+  const archivedMap = loadArchivedMap(process.env);
   const hasRealAliases = hasConfiguredAliases(process.env);
   const aliases = readAliases(process.env, { fallbackExample: true });
   const conflicts = detectConflicts({ env: process.env, convId: activeConvId, config: cfg });
@@ -170,7 +263,7 @@ function buildSnapshot(activeConvId) {
     if (!byWs.has(wsName)) byWs.set(wsName, []);
     byWs.get(wsName).push({ cid, entry });
 
-    const health = sessionHealth(entry, nowSec);
+    const health = sessionHealth(entry, nowSec, retryWindowSec);
     const ts = Number(entry.ts || 0);
     trackedSessions.push({
       convId: cid,
@@ -183,17 +276,22 @@ function buildSnapshot(activeConvId) {
       tries: Number(entry.tries || 0),
       step: entry.step ?? null,
       offloadMode: Boolean(entry.offload_mode),
-      withinWindow: Boolean(ts && (nowSec - ts <= RETRY_WINDOW_SEC)),
+      withinWindow: Boolean(ts && (nowSec - ts <= retryWindowSec)),
       updatedAtMs: ts ? Math.round(ts * 1000) : 0,
     });
   }
   trackedSessions.sort((a, b) => b.updatedAtMs - a.updatedAtMs);
 
   const workspaces = [];
+  const seenWsDirs = new Set();
   let emptyWorkspaceCount = 0;
+  let archivedCount = 0;
+  let cacheHits = 0;
+  let cacheMisses = 0;
+
   if (existsSync(noteRoot)) {
     for (const ent of readdirSync(noteRoot, { withFileTypes: true })) {
-      if (!ent.isDirectory()) continue;
+      if (!ent.isDirectory() || RESERVED_WS_NAMES.has(ent.name.toLowerCase())) continue;
       const wsDir = join(noteRoot, ent.name);
       let stat;
       try {
@@ -203,59 +301,67 @@ function buildSnapshot(activeConvId) {
         continue;
       }
 
-      const empty = isDirEmpty(wsDir);
-      if (empty) emptyWorkspaceCount += 1;
-
-      if (!WS_RE_CHECK(ent.name)) continue;
-
-      let rawFiles = [];
-      try {
-        rawFiles = readdirSync(wsDir, { withFileTypes: true })
-          .filter((f) => f.isFile() && FILE_NAME_RE.test(f.name))
-          .map((f) => f.name);
-      } catch {
-        rawFiles = [];
+      seenWsDirs.add(wsDir);
+      if (!WS_RE_CHECK(ent.name)) {
+        if (isDirEmpty(wsDir)) emptyWorkspaceCount += 1;
+        continue;
       }
 
-      const files = sortWorkspaceFiles(rawFiles);
-      let latestMtimeMs = stat.mtimeMs;
-      for (const f of files) {
-        try {
-          const mst = statSync(join(wsDir, f)).mtimeMs;
-          if (mst > latestMtimeMs) latestMtimeMs = mst;
-        } catch {
-          // 忽略瞬时读写误差
-        }
-      }
+      const scanned = scanWorkspaceCached(wsDir, stat);
+      if (scanned.cacheHit) cacheHits += 1;
+      else cacheMisses += 1;
+
+      const archInfo = archivedMap[ent.name] || null;
+      const isArchived = Boolean(archInfo);
+      if (isArchived) archivedCount += 1;
+      if (scanned.empty && !isArchived) emptyWorkspaceCount += 1;
 
       const binds = byWs.get(ent.name) || [];
-      let bound = null;
-      if (binds.length > 0) {
-        binds.sort((a, b) => Number(b.entry.ts || 0) - Number(a.entry.ts || 0));
-        bound = binds[0];
-      }
+      binds.sort((a, b) => Number(b.entry.ts || 0) - Number(a.entry.ts || 0));
+      const bound = binds.length > 0 ? binds[0] : null;
+      const boundSessions = binds.map(({ cid, entry }) => {
+        const h = sessionHealth(entry, nowSec, retryWindowSec);
+        const ts = Number(entry.ts || 0);
+        return {
+          convId: cid,
+          convShort: cid.slice(0, 8),
+          health: h,
+          dead: h.startsWith('DEAD'),
+          step: entry.step ?? null,
+          offloadMode: Boolean(entry.offload_mode),
+          updatedAtMs: ts ? Math.round(ts * 1000) : 0,
+        };
+      });
 
-      const turnInfo = summarizeTurns(files);
       workspaces.push({
         name: ent.name,
         shortPath: shortPath(wsDir),
         absPath: wsDir,
-        fileCount: files.length,
-        files,
-        hasTask: files.includes('task.md'),
-        hasStatus: files.includes('status.md'),
-        taskProgress: readTaskProgress(wsDir),
-        turnCount: turnInfo.turnCount,
-        latestTurn: turnInfo.latestTurn,
-        latestTurnFile: turnInfo.latestTurnFile,
-        isEmpty: empty,
-        updatedAtMs: Math.round(latestMtimeMs),
+        fileCount: scanned.files.length,
+        files: scanned.files,
+        hasTask: scanned.hasTask,
+        hasStatus: scanned.hasStatus,
+        taskProgress: scanned.taskProgress,
+        turnCount: scanned.turnInfo.turnCount,
+        latestTurn: scanned.turnInfo.latestTurn,
+        latestTurnFile: scanned.turnInfo.latestTurnFile,
+        isEmpty: scanned.empty,
+        archived: isArchived,
+        archivedAt: archInfo?.archivedAt || '',
+        updatedAtMs: Math.round(scanned.latestMtimeMs),
         boundConvId: bound ? bound.cid : '',
         boundConvShort: bound ? bound.cid.slice(0, 8) : '',
-        health: bound ? sessionHealth(bound.entry, nowSec) : '-',
+        boundSessions,
+        sessionCount: boundSessions.length,
+        health: bound ? sessionHealth(bound.entry, nowSec, retryWindowSec) : '-',
         step: bound?.entry?.step ?? null,
-        summary: readStatusSummary(wsDir, 120),
+        summary: scanned.summary,
       });
+    }
+  }
+  for (const cachedDir of wsScanCache.keys()) {
+    if (!seenWsDirs.has(cachedDir)) {
+      wsScanCache.delete(cachedDir);
     }
   }
   workspaces.sort((a, b) => b.updatedAtMs - a.updatedAtMs);
@@ -269,6 +375,8 @@ function buildSnapshot(activeConvId) {
     hasRealAliases,
     aliasesIsExample: !hasRealAliases && aliases.length > 0,
     emptyWorkspaceCount,
+    archivedCount,
+    cacheStats: { hits: cacheHits, misses: cacheMisses },
     conflicts,
     workspaces,
     trackedSessions,
@@ -498,6 +606,7 @@ jsonApi('/api/workspace/save', (data) => {
     throw new HttpError(413, '文件内容超过 5 MB 上限');
   }
   atomicWriteSync(filePath, content);
+  wsScanCache.delete(wsDir);
   return {
     ok: true,
     workspace: wsName,
@@ -506,8 +615,20 @@ jsonApi('/api/workspace/save', (data) => {
   };
 }, 'POST');
 
+jsonApi('/api/workspace/archive', (data) => {
+  const wsName = String(data?.workspace || '').trim();
+  const archived = data?.archived !== false;
+  const move = data?.move === true;
+  const res = archived
+    ? archiveWorkspace(wsName, { move })
+    : unarchiveWorkspace(wsName);
+  wsScanCache.clear();
+  return res;
+}, 'POST');
+
 jsonApi('/api/workspace/clean', () => {
   const res = cleanEmptyWorkspaces();
+  wsScanCache.clear();
   return {
     ok: true,
     removedCount: res.removed.length,
@@ -535,20 +656,19 @@ jsonApi('/api/state/reset', (data) => {
 }, 'POST');
 
 jsonApi('/api/config/update', (data) => {
-  const patch = {};
-  if (Object.hasOwn(data, 'sanitizeEnabled')) {
-    if (typeof data.sanitizeEnabled !== 'boolean') {
-      throw new HttpError(400, 'sanitizeEnabled 必须为布尔值');
-    }
-    patch.sanitizeEnabled = data.sanitizeEnabled;
-  }
-  if (Object.hasOwn(data, 'aliasEnabled')) {
-    if (typeof data.aliasEnabled !== 'boolean') {
-      throw new HttpError(400, 'aliasEnabled 必须为布尔值');
-    }
-    patch.aliasEnabled = data.aliasEnabled;
-  }
+  const patch = { ...data };
+  delete patch.conversationId;
   const config = saveConfig(patch);
+  const conv = data?.conversationId || app.config?.conversationId || '';
+  return {
+    ok: true,
+    config,
+    conflicts: detectConflicts({ env: process.env, convId: conv, config }),
+  };
+}, 'POST');
+
+jsonApi('/api/config/reset', (data) => {
+  const config = resetConfig();
   const conv = data?.conversationId || app.config?.conversationId || '';
   return {
     ok: true,

@@ -38,20 +38,23 @@ description: >-
 5. **分片读取**：
    - 读取大日志或历史详稿时用 `grep` 定位加 `sed` 或 `read_file` 分片读取，禁止整份 `cat`。
 
-## 3. 可选项与插件配套工具
+## 3. 可选项配置中心与插件配套工具
 
-本插件遵循 Antigravity 单包自包含规范；**词表中性化与远端地址别名（`neturl.mjs`）默认关闭**，可在需要时通过 `agynote.mjs config` 或 Sidecar 面板按需开启，系统会自动扫描并提示与并发插件或官方保留字间的潜在冲突。
+本插件遵循 Antigravity 单包自包含规范；**词表中性化与远端地址别名（`neturl.mjs`）默认关闭**，`Orchestrator` 启用确认默认采用**首启一次性（`once`）**（首次确认后全局记住，总控始终按会话级确认）。全部策略与重试阈值均可在 Sidecar 设置中心或 `agynote.mjs config` 中编辑，并支持一键恢复内置默认。
 
-- 工作台管理、配置与诊断：[agynote.mjs](../../scripts/agynote.mjs)
+- 工作台管理、归档、配置中心与诊断：[agynote.mjs](../../scripts/agynote.mjs)
   - `node <插件目录>/scripts/agynote.mjs init <工作台名> [任务文件|-]`
-  - `node <插件目录>/scripts/agynote.mjs show <工作台名>`
-  - `node <插件目录>/scripts/agynote.mjs status`
+  - `node <插件目录>/scripts/agynote.mjs show <工作台名或前缀>`（展示看板摘要、全部关联历史会话与最新详稿）
+  - `node <插件目录>/scripts/agynote.mjs status [all] [--archived] [--dead] [--filter <kw>] [--json]`
+  - `node <插件目录>/scripts/agynote.mjs archive <工作台名> [--move]`（默认逻辑归档保留原路径不断链；`--move` 物理移入 `_archive/`）
+  - `node <插件目录>/scripts/agynote.mjs unarchive <工作台名>`
+  - `node <插件目录>/scripts/agynote.mjs reset <会话ID或前缀>`（解除单会话重试与熔断锁定）
   - `node <插件目录>/scripts/agynote.mjs clean`
-  - `node <插件目录>/scripts/agynote.mjs config [--sanitize on|off] [--alias on|off]`
-  - `node <插件目录>/scripts/agynote.mjs doctor`
-- 旧会话 `transcript.jsonl` 极简摘要（自动跨桌面端 / CLI / IDE 寻址）：[agysum.mjs](../../scripts/agysum.mjs)
-  - `node <插件目录>/scripts/agysum.mjs <会话ID或前缀> --tail 40 --width 120`
+  - `node <插件目录>/scripts/agynote.mjs config [--sanitize on|off] [--alias on|off] [--orch-confirm once|per_session|off] [--max-retry N] [--retry-window N] [--reset]`
+  - `node <插件目录>/scripts/agynote.mjs doctor [--json]`
+- 旧会话 `transcript.jsonl` 极简摘要（自动跨桌面端 / CLI / IDE 寻址、大日志尾部分块快读、默认附修改文件清单）：[agysum.mjs](../../scripts/agysum.mjs)
+  - `node <插件目录>/scripts/agysum.mjs <会话ID或前缀> [--tail 40] [--width 120] [--tools] [--search <kw>] [--full] [--json]`
 - 远端地址别名解析与登记（可选开启，数据文件 `<PLUGIN_DATA>/net-map.tsv`）：[neturl.mjs](../../scripts/neturl.mjs)
   - `node <插件目录>/scripts/neturl.mjs --list`
   - `node <插件目录>/scripts/neturl.mjs gw-a /v1/path`
-- 可视化侧边栏面板：在适当场景下可提供 `[Note Offload](sidecar://note-offload/board/)` 药丸打开右侧栏工作台看板（支持 `> 1 MB` 文件分片翻页浏览、可选项开关、冲突风险检测以及确认风险后解锁详稿在线编辑）。
+- 可视化侧边栏面板：在适当场景下可提供 `[Note Offload](sidecar://note-offload/board/)` 药丸打开右侧栏工作台看板（支持增量缓存、逻辑归档、单工作台多会话历史、可编辑配置中心与一键恢复默认、黑匣子飞行诊断、`> 1 MB` 文件分片翻页浏览以及确认风险后解锁详稿在线编辑）。
