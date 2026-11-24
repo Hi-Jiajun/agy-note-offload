@@ -279,6 +279,10 @@ export function getArchiveLockPath(env = process.env) {
   return join(getDataDir(env), 'archived.json.lock');
 }
 
+export function getHeartbeatPath(env = process.env) {
+  return join(getDataDir(env), 'heartbeat.json');
+}
+
 export function getExampleMapPath(env = process.env) {
   return join(getPluginRoot(env), 'scripts', 'net-map.tsv.example');
 }

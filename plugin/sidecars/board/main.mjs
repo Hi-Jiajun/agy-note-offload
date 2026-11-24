@@ -21,6 +21,7 @@ import {
   appendFlightEvent,
   clearFlightLogs,
   readFlightEvents,
+  readHookHeartbeat,
   SLOW_OP_THRESHOLD_MS,
   summarizeFlightEvents,
 } from '../../lib/logger.mjs';
@@ -383,6 +384,7 @@ function buildSnapshot(activeConvId) {
     aliases,
     logs: readLogs(40),
     flightSummary: summarizeFlightEvents(process.env),
+    heartbeat: readHookHeartbeat(process.env),
   };
 }
 

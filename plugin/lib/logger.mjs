@@ -8,11 +8,13 @@ import {
   unlinkSync,
 } from 'node:fs';
 import { join, resolve } from 'node:path';
-import { getDataDir } from './paths.mjs';
+import { atomicWriteSync } from './lock.mjs';
+import { getDataDir, getPluginRoot } from './paths.mjs';
 
 export const DEFAULT_LOG_MAX_BYTES = 2 * 1024 * 1024;
 export const DEFAULT_LOG_MAX_FILES = 3;
 export const SLOW_OP_THRESHOLD_MS = 100;
+export const DEFAULT_HEARTBEAT_INTERVAL_MS = 30 * 60 * 1000;
 
 const HOME_DIR_RE = new RegExp('/(?:' + 'ho' + 'me|' + 'Us' + 'ers)/[^/\\s"\'`]+', 'g');
 const PRIVATE_IP_RE = new RegExp(
@@ -50,6 +52,87 @@ export function getFlightLogDir(dataDirOrEnv = process.env) {
 
 export function getFlightLogPath(dataDirOrEnv = process.env) {
   return join(getFlightLogDir(dataDirOrEnv), 'offload-flight.jsonl');
+}
+
+export function getHeartbeatFilePath(dataDirOrEnv = process.env) {
+  return join(resolveTargetDataDir(dataDirOrEnv), 'heartbeat.json');
+}
+
+let cachedPluginVersion = null;
+function getPluginVersionFast(dataDirOrEnv) {
+  if (cachedPluginVersion !== null) return cachedPluginVersion;
+  try {
+    const env = dataDirOrEnv && typeof dataDirOrEnv === 'object' && !dataDirOrEnv.dataDir
+      ? (dataDirOrEnv.env || dataDirOrEnv)
+      : process.env;
+    const meta = JSON.parse(readFileSync(join(getPluginRoot(env), 'plugin.json'), 'utf-8'));
+    cachedPluginVersion = typeof meta?.version === 'string' ? meta.version.trim() : '';
+  } catch {
+    cachedPluginVersion = '';
+  }
+  return cachedPluginVersion;
+}
+
+/**
+ * 无锁节流写入 Hook 存活心跳（heartbeat.json），默认每 30 分钟最多原子写一次，零日志污染。
+ * @param {string | NodeJS.ProcessEnv | { dataDir?: string, env?: NodeJS.ProcessEnv }} dataDirOrEnv
+ * @param {{ event?: string, hook?: string, version?: string }} [meta]
+ * @param {{ minIntervalMs?: number, nowMs?: number }} [options]
+ * @returns {boolean} 本次是否实际落盘刷新
+ */
+export function touchHookHeartbeat(
+  dataDirOrEnv = process.env,
+  { event = '', hook = '', version = '' } = {},
+  { minIntervalMs = DEFAULT_HEARTBEAT_INTERVAL_MS, nowMs = Date.now() } = {},
+) {
+  try {
+    const hbPath = getHeartbeatFilePath(dataDirOrEnv);
+    if (minIntervalMs > 0 && existsSync(hbPath)) {
+      try {
+        const st = statSync(hbPath);
+        if (nowMs - st.mtimeMs < minIntervalMs) {
+          return false;
+        }
+      } catch {
+        // 读取 mtime 失败则允许重写
+      }
+    }
+    const payload = {
+      ts: new Date(nowMs).toISOString(),
+      tsMs: Math.round(nowMs),
+      event: sanitizeLogString(event || 'unknown', 40),
+      hook: sanitizeLogString(hook || 'unknown', 40),
+      version: sanitizeLogString(version || getPluginVersionFast(dataDirOrEnv), 32),
+    };
+    atomicWriteSync(hbPath, `${JSON.stringify(payload)}\n`);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * 读取 Hook 最近存活心跳记录；不存在或损坏时返回 null。
+ * @param {string | NodeJS.ProcessEnv | { dataDir?: string, env?: NodeJS.ProcessEnv }} [dataDirOrEnv]
+ */
+export function readHookHeartbeat(dataDirOrEnv = process.env) {
+  try {
+    const hbPath = getHeartbeatFilePath(dataDirOrEnv);
+    if (!existsSync(hbPath)) return null;
+    const parsed = JSON.parse(readFileSync(hbPath, 'utf-8'));
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return null;
+    const tsMs = Number.isFinite(parsed.tsMs) ? parsed.tsMs : Date.parse(parsed.ts || '');
+    if (!Number.isFinite(tsMs) || tsMs <= 0) return null;
+    return {
+      ts: typeof parsed.ts === 'string' && parsed.ts ? parsed.ts : new Date(tsMs).toISOString(),
+      tsMs: Math.round(tsMs),
+      event: typeof parsed.event === 'string' ? parsed.event : '',
+      hook: typeof parsed.hook === 'string' ? parsed.hook : '',
+      version: typeof parsed.version === 'string' ? parsed.version : '',
+    };
+  } catch {
+    return null;
+  }
 }
 
 export function sanitizeLogString(input, maxLen = 400) {

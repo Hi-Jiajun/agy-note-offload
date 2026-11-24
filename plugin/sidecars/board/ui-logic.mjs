@@ -426,3 +426,17 @@ export function formatFlightSummaryText(summary) {
   const slow = Number(summary.slowCount || 0);
   return `近 24h ${total} 事件 / ${err} 错误 / ${warn} 警告 / ${slow} 慢调用`;
 }
+
+export function formatHeartbeatText(hb, nowMs = Date.now()) {
+  if (!hb || typeof hb !== 'object' || !Number.isFinite(hb.tsMs)) {
+    return 'Hook 存活：等待首次宿主拉起';
+  }
+  const diffSec = Math.max(0, Math.floor((nowMs - hb.tsMs) / 1000));
+  let age;
+  if (diffSec < 60) age = '刚刚';
+  else if (diffSec < 3600) age = `${Math.floor(diffSec / 60)} 分钟前`;
+  else if (diffSec < 48 * 3600) age = `${Math.floor(diffSec / 3600)} 小时前`;
+  else age = `${Math.floor(diffSec / (24 * 3600))} 天前`;
+  const evPart = hb.event ? ` (${hb.event})` : '';
+  return `Hook 存活：${age}${evPart}`;
+}

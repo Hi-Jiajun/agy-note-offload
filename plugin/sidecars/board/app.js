@@ -10,6 +10,7 @@ import {
   fmtTime,
   formatFlightLevel,
   formatFlightSummaryText,
+  formatHeartbeatText,
   inferLatestTurn,
   isSessionWithinWindow,
   maskValue,
@@ -301,6 +302,7 @@ const state = {
       aliases: snap.aliases,
       logs: snap.logs,
       flightSummary: snap.flightSummary,
+      heartbeat: snap.heartbeat,
     });
   }
 
@@ -1019,6 +1021,7 @@ const state = {
 
   function renderDiagnosticsPanel() {
     $('diag-summary').textContent = formatFlightSummaryText(state.snap?.flightSummary);
+    $('diag-heartbeat').textContent = formatHeartbeatText(state.snap?.heartbeat);
     $('diag-drawer').classList.toggle('hidden', !state.diagOpen);
     const toggleBtn = $('btn-toggle-diag');
     toggleBtn.textContent = state.diagOpen ? '收起' : '展开';

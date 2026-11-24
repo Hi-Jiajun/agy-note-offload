@@ -5,7 +5,7 @@
 import { closeSync, existsSync, openSync, readFileSync, readSync, statSync } from 'node:fs';
 import { loadConfig } from '../lib/config.mjs';
 import { isActiveControlTowerController } from '../lib/conflicts.mjs';
-import { appendFlightEvent, SLOW_OP_THRESHOLD_MS } from '../lib/logger.mjs';
+import { appendFlightEvent, SLOW_OP_THRESHOLD_MS, touchHookHeartbeat } from '../lib/logger.mjs';
 import { applySanitizeIfEnabled } from '../lib/sanitize.mjs';
 import {
   appendLog,
@@ -181,6 +181,8 @@ function main() {
     process.stdout.write('{}\n');
     return;
   }
+
+  touchHookHeartbeat(process.env, { event: EXPECTED, hook: 'hook-retry' });
 
   const conv = payload.conversationId || 'unknown';
   const reasonTag = String(payload.terminationReason || '');

@@ -29,6 +29,7 @@ import {
 } from '../lib/config.mjs';
 import { detectConflicts } from '../lib/conflicts.mjs';
 import { atomicWriteSync } from '../lib/lock.mjs';
+import { readHookHeartbeat } from '../lib/logger.mjs';
 import {
   expandHome,
   getConfigPath,
@@ -594,6 +595,7 @@ function cmdDoctor(args) {
   const cfg = loadConfig();
   const realAliasCount = hasConfiguredAliases() ? readAliases(process.env, { fallbackExample: false }).length : 0;
   const archivedCount = Object.keys(loadArchivedMap()).length;
+  const heartbeat = readHookHeartbeat(process.env);
   const conflicts = detectConflicts({ env: process.env, config: cfg, workspacePaths: [process.cwd()] });
 
   if (jsonMode) {
@@ -603,6 +605,7 @@ function cmdDoctor(args) {
       config: cfg,
       realAliasCount,
       archivedCount,
+      heartbeat,
       conflicts,
     }, null, 2)}\n`);
     return;
@@ -615,6 +618,11 @@ function cmdDoctor(args) {
   );
   process.stdout.write(`已配置真实别名数: ${realAliasCount}\n`);
   process.stdout.write(`已归档工作台数: ${archivedCount}\n`);
+  process.stdout.write(
+    heartbeat
+      ? `Hook 心跳: 最近拉起 ${formatMonthDayTime(heartbeat.tsMs)} (event=${heartbeat.event || 'unknown'})\n`
+      : 'Hook 心跳: 尚无记录（首次触发宿主 Hook 后写入）\n',
+  );
   printConflicts(conflicts);
 }
 

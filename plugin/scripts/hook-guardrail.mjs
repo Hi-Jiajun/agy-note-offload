@@ -3,7 +3,7 @@
  * Antigravity SessionStart hook: 普通会话零污染——仅清理同会话残留状态，不提前建目录、不注入额外指令。
  */
 import { readFileSync } from 'node:fs';
-import { appendFlightEvent } from '../lib/logger.mjs';
+import { appendFlightEvent, touchHookHeartbeat } from '../lib/logger.mjs';
 import { appendLog, loadState, saveState, withStateLock } from '../lib/state.mjs';
 
 const EXPECTED = 'SessionStart';
@@ -34,6 +34,8 @@ function main() {
     process.stdout.write('{}\n');
     return;
   }
+
+  touchHookHeartbeat(process.env, { event: EXPECTED, hook: 'hook-guardrail' });
 
   const conv = payload.conversationId || '';
   let cleaned = false;

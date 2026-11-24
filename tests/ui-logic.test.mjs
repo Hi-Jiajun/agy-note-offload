@@ -8,9 +8,11 @@ import {
   clearFlightLogs,
   getFlightLogPath,
   readFlightEvents,
+  readHookHeartbeat,
   sanitizeLogString,
   sanitizeLogValue,
   summarizeFlightEvents,
+  touchHookHeartbeat,
 } from '../plugin/lib/logger.mjs';
 import {
   badgeClass,
@@ -23,6 +25,7 @@ import {
   fmtTime,
   formatFlightLevel,
   formatFlightSummaryText,
+  formatHeartbeatText,
   inferLatestTurn,
   isSessionWithinWindow,
   maskValue,
@@ -141,6 +144,8 @@ describe('L1 Sidecar 前端纯逻辑模块 (ui-logic.mjs)', () => {
     assert.equal(filterLogs(logs, { logFilter: 'current', activeConv8: 'abcd1234' }).length, 1);
     assert.equal(formatFlightLevel('error').label, 'ERR');
     assert.match(formatFlightSummaryText({ total: 3, byLevel: { error: 1, warn: 1 }, slowCount: 1 }), /3 事件/);
+    assert.match(formatHeartbeatText(null), /等待首次宿主拉起/);
+    assert.match(formatHeartbeatText({ tsMs: Date.now() - 5 * 60 * 1000, event: 'PreInvocation' }), /5 分钟前 \(PreInvocation\)/);
   });
 });
 
@@ -227,5 +232,28 @@ describe('Ring 1 黑匣子飞行日志与文件锁超时防护 (logger.mjs + loc
       (err) => err?.code === 'ELOCKTIMEOUT',
     );
     assert.equal(strictCalled, true);
+  });
+
+  it('touchHookHeartbeat 按 30 分钟窗口无锁节流写 heartbeat.json，超时后刷新', () => {
+    const sb = newSandbox();
+    assert.equal(readHookHeartbeat(sb.dataDir), null);
+
+    const t0 = Date.now();
+    assert.equal(touchHookHeartbeat(sb.dataDir, { event: 'PreInvocation', hook: 'hook-notice', version: '2.2.1' }, { nowMs: t0 }), true);
+    const hb1 = readHookHeartbeat(sb.dataDir);
+    assert.equal(hb1?.event, 'PreInvocation');
+    assert.equal(hb1?.hook, 'hook-notice');
+    assert.equal(hb1?.version, '2.2.1');
+
+    // 窗口期内二次调用节流跳过（零磁盘写入）
+    assert.equal(touchHookHeartbeat(sb.dataDir, { event: 'Stop', hook: 'hook-retry' }, { nowMs: t0 + 60_000 }), false);
+    assert.equal(readHookHeartbeat(sb.dataDir)?.event, 'PreInvocation');
+
+    // 超过节流窗口后自动刷新
+    assert.equal(
+      touchHookHeartbeat(sb.dataDir, { event: 'Stop', hook: 'hook-retry', version: '2.2.1' }, { minIntervalMs: 1000, nowMs: Date.now() + 2000 }),
+      true,
+    );
+    assert.equal(readHookHeartbeat(sb.dataDir)?.event, 'Stop');
   });
 });

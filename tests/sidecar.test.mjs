@@ -6,6 +6,7 @@ import { homedir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { afterEach, describe, it } from 'node:test';
 import { pathToFileURL } from 'node:url';
+import { touchHookHeartbeat } from '../plugin/lib/logger.mjs';
 import { createSandbox } from './helpers/sandbox.mjs';
 
 const SIDECAR_DIR = resolve('plugin', 'sidecars', 'board');
@@ -338,10 +339,12 @@ describe('Sidecar 后端契约（实测 sidecar_sdk）与前端安全检查', ()
 
       const cleanRes = JSON.parse((await reqJson(base, token, 'POST', '/api/workspace/clean', {})).text);
       assert.equal(cleanRes.removedCount, 1);
+      touchHookHeartbeat(sb.dataDir, { event: 'PreInvocation', hook: 'hook-notice' });
       const snapAfterClean = JSON.parse((await reqJson(base, token, 'POST', '/api/snapshot', {})).text);
       assert.equal(snapAfterClean.emptyWorkspaceCount, 0);
       assert.equal(typeof snapAfterClean.version, 'string');
       assert.equal(typeof snapAfterClean.flightSummary?.total, 'number');
+      assert.equal(snapAfterClean.heartbeat?.event, 'PreInvocation');
 
       // 6. 黑匣子飞行诊断读取与清空（鉴权保护）
       assert.equal((await reqJson(base, token, 'POST', '/api/diagnostics/logs', {}, false)).status, 401);

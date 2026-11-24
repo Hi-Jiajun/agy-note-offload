@@ -1,5 +1,10 @@
 # Changelog
 
+## [2.2.1] - 2026-11-24
+
+### Added
+- **无锁 30 分钟节流 Hook 存活心跳（`heartbeat.json`）**：在 `plugin/lib/logger.mjs` 新增 `touchHookHeartbeat` 与 `readHookHeartbeat`，由 `SessionStart` / `PreInvocation` / `Stop` 钩子按文件 `mtimeMs` 每 30 分钟最多原子刷新一次，在不污染 `hook-invocations.log` 与 `offload-flight.jsonl` 的前提下，让 `npm run doctor`、`agynote.mjs doctor` 与 Sidecar 监控栏直观确认宿主正在持续正常拉起钩子。
+
 ## [2.2.0] - 2026-11-24
 
 ### Added

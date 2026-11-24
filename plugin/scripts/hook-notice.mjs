@@ -7,7 +7,7 @@ import { join } from 'node:path';
 import { hasConfiguredAliases } from '../lib/aliases.mjs';
 import { loadConfig, saveConfig } from '../lib/config.mjs';
 import { detectConflicts, isActiveControlTowerController } from '../lib/conflicts.mjs';
-import { appendFlightEvent, SLOW_OP_THRESHOLD_MS } from '../lib/logger.mjs';
+import { appendFlightEvent, SLOW_OP_THRESHOLD_MS, touchHookHeartbeat } from '../lib/logger.mjs';
 import { getMapPath, getPluginRoot, shortPath } from '../lib/paths.mjs';
 import { applySanitizeIfEnabled } from '../lib/sanitize.mjs';
 import {
@@ -265,6 +265,8 @@ function main() {
     process.stdout.write('{}\n');
     return;
   }
+
+  touchHookHeartbeat(process.env, { event: EXPECTED, hook: 'hook-notice' });
 
   const conv = payload.conversationId || '';
   if (!conv) {

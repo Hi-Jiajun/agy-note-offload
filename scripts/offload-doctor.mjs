@@ -8,7 +8,7 @@ import { spawnSync } from 'node:child_process';
 import { existsSync, readdirSync, readFileSync, readlinkSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { summarizeFlightEvents } from '../plugin/lib/logger.mjs';
+import { readHookHeartbeat, summarizeFlightEvents } from '../plugin/lib/logger.mjs';
 import { getDataDir, getGlobalConfigDir, getNoteRoot } from '../plugin/lib/paths.mjs';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -62,6 +62,16 @@ function inspectRunningSidecars() {
     }
   }
   return { supported: true, running, stale };
+}
+
+function formatRelativeAge(tsMs, nowMs = Date.now()) {
+  const diffSec = Math.max(0, Math.floor((nowMs - tsMs) / 1000));
+  if (diffSec < 60) return '刚刚';
+  const min = Math.floor(diffSec / 60);
+  if (min < 60) return `${min} 分钟前`;
+  const hr = Math.floor(min / 60);
+  if (hr < 48) return `${hr} 小时前`;
+  return `${Math.floor(hr / 24)} 天前`;
 }
 
 function listReleaseSnapshotDirs(dataDir) {
@@ -229,6 +239,23 @@ export function runDoctor({
     });
   }
 
+  // 5b) Hook 存活心跳（30 分钟节流）
+  const heartbeat = readHookHeartbeat(resolvedDataDir);
+  if (heartbeat) {
+    const verStr = heartbeat.version ? `, v${heartbeat.version}` : '';
+    checks.push({
+      id: 'hook_heartbeat',
+      status: 'pass',
+      detail: `Hooks 活跃（最近拉起：${formatRelativeAge(heartbeat.tsMs)}, event=${heartbeat.event || 'unknown'}${verStr}）`,
+    });
+  } else {
+    checks.push({
+      id: 'hook_heartbeat',
+      status: 'pass',
+      detail: '尚无心跳记录（首次触发宿主 Hook 后自动写入，每 30 分钟节流刷新）',
+    });
+  }
+
   // 6) 工作台根目录存在性检查
   const noteRoot = getNoteRoot(env);
   checks.push({
@@ -257,6 +284,7 @@ export function runDoctor({
     warnCount,
     repoVersion,
     installedVersion,
+    heartbeat,
     snapshots,
     checks,
   };

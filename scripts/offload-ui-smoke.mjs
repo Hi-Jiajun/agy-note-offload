@@ -13,7 +13,7 @@ import { homedir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { upsertAlias } from '../plugin/lib/aliases.mjs';
-import { appendFlightEvent } from '../plugin/lib/logger.mjs';
+import { appendFlightEvent, touchHookHeartbeat } from '../plugin/lib/logger.mjs';
 import { createSandbox } from '../tests/helpers/sandbox.mjs';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -278,6 +278,7 @@ export async function runUiSmoke({ requireBrowser = false } = {}) {
       conv: convId,
       message: 'Smoke test warn event',
     });
+    touchHookHeartbeat(sb.dataDir, { event: 'PreInvocation', hook: 'hook-notice', version: pluginMeta.version });
 
     const port = await getFreePort();
     const token = 'offload-ui-smoke-token';
@@ -395,7 +396,9 @@ export async function runUiSmoke({ requireBrowser = false } = {}) {
       checks.push(`narrow-dark:${tab}`);
     }
 
-    // 5) 展开黑匣子飞行诊断抽屉并验证筛选交互
+    // 5) 展开黑匣子飞行诊断抽屉并验证心跳文案与筛选交互
+    const hbText = await cdp.evaluate(`document.getElementById('diag-heartbeat')?.textContent?.trim()`);
+    assert.match(hbText || '', /PreInvocation/);
     await cdp.evaluate(`document.getElementById('btn-toggle-diag')?.click()`);
     await waitForCondition(
       async () => Number(await cdp.evaluate(`document.querySelectorAll('#diag-events-list .diag-row').length`)) >= 2,
