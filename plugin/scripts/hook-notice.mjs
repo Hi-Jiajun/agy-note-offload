@@ -28,6 +28,18 @@ import {
 const EXPECTED = 'PreInvocation';
 const TAIL_BYTES = 131_072;
 const RULE_REV = 2;
+const DUAL_PHASE_TOOLS = new Set(['exit_plan_mode', 'enter_plan_mode']);
+
+function hasToolCall(rec, names) {
+  const calls = Array.isArray(rec?.tool_calls) ? rec.tool_calls : [];
+  for (const c of calls) {
+    const name = String(
+      typeof c === 'string' ? c : (c?.name || c?.tool_name || c?.function?.name || ''),
+    ).toLowerCase();
+    if (name && names.has(name)) return true;
+  }
+  return false;
+}
 
 function getPluginRuleMeta(env = process.env) {
   let pluginVersion = '2.0.0';
@@ -50,6 +62,7 @@ const OFFLOAD_RULE =
   '若处于规划阶段（Plan Mode / Orchestrator），保持只读调研不直接写文件，调用 exit_plan_mode 时完整传递核心分析结论、' +
   '精确改动方案、验证命令与 Re-plan if 回退条件（仅禁止直接粘贴原始长日志或大段反汇编文本），由执行阶段写入 {dir}/turn-<递增序号>.md ' +
   '并同步更新 {dir}/status.md（复核回合若已落盘完毕则直接精简收尾）；执行阶段按目录内现有最大序号 +1 连续写入 turn-N.md 并更新 status.md，' +
+  '需调用 enter_plan_mode 回退规划复核前亦应先将阶段进展写入 turn-N.md 与 status.md，' +
   '脚本详细输出直写文件（终端 stdout <= 20 行摘要），读大文件用 read_file 分片读取；' +
   '中间调用工具仅保留极简单句里程碑、禁刷长文；每轮收尾控制在 1~3 行（结论正文 <= 150 字，附可点击 [文件名](file://<绝对路径>) 链接，链接路径长度不计入字数）；' +
   '如需恢复常规详答可发 /note-offload off。';
@@ -132,27 +145,28 @@ function isOrchestratorSession(payload) {
   let sawWorker = false;
   for (let i = recs.length - 1; i >= 0; i -= 1) {
     const r = recs[i];
-    if (r.type === 'PLANNER_RESPONSE' && r.model) {
-      const m = String(r.model).toLowerCase();
-      if (m.includes('orchestrator')) return true;
-      if (m.includes('worker')) {
-        sawWorker = true;
-        continue;
+    if (r.type === 'SYSTEM_MESSAGE' && typeof r.content === 'string') {
+      if (
+        r.content.includes('Plan mode is on:') ||
+        r.content.includes('[plan review]') ||
+        r.content.includes('Plan mode is off:')
+      ) {
+        return true;
       }
-      return false;
-    }
-    if (r.type === 'USER_INPUT' && typeof r.content === 'string') {
+    } else if (r.type === 'PLANNER_RESPONSE') {
+      if (hasToolCall(r, DUAL_PHASE_TOOLS)) return true;
+      if (r.model) {
+        const m = String(r.model).toLowerCase();
+        if (m.includes('orchestrator')) return true;
+        if (m.includes('worker')) sawWorker = true;
+      }
+    } else if (r.type === 'USER_INPUT' && typeof r.content === 'string') {
       if (r.content.includes('<USER_SETTINGS_CHANGE>') && r.content.includes('Model Selection')) {
         return r.content.includes('Orchestrator');
       }
     }
-    if (!sawWorker && r.type === 'SYSTEM_MESSAGE' && typeof r.content === 'string') {
-      if (r.content.includes('Plan mode is on:') || r.content.includes('[plan review]')) {
-        return true;
-      }
-    }
   }
-  return false;
+  return sawWorker;
 }
 
 function normalizeShortPhrase(text) {
@@ -276,41 +290,25 @@ function main() {
 
   const hasInputField = Object.hasOwn(payload, 'lastUserInput') && payload.lastUserInput !== null && payload.lastUserInput !== undefined;
   const lastRaw = String(payload.lastUserInput || '');
-  const cfg = loadConfig(process.env);
-  const retryWindowSec = cfg.retryWindowMin * 60;
-  const maxRetry = cfg.maxRetry;
-  const { pluginVersion, ruleVersion } = getPluginRuleMeta(process.env);
-  const wsPaths = [
-    ...new Set(
-      [
-        ...(Array.isArray(payload.workspacePaths) ? payload.workspacePaths : []),
-        ...(payload.cwd ? [payload.cwd] : []),
-      ].filter((p) => typeof p === 'string' && p.trim()),
-    ),
-  ];
-  const hintPath = String(payload.transcriptPath || payload.artifactDirectoryPath || '');
-  const isCtController = isActiveControlTowerController({
-    convId: conv,
-    workspacePaths: wsPaths,
-    env: process.env,
-    hintPath,
-  });
 
   if (lastRaw.trimStart().startsWith('/compact')) {
+    const preState = loadState();
     let unlocked = false;
-    withStateLock(() => {
-      const state = loadState();
-      if (Object.hasOwn(state, conv) && state[conv] && typeof state[conv] === 'object') {
-        const entry = { ...state[conv] };
-        for (const k of ['tries', 'zero_streak', 'dead', 'dead_reason', 'notified', 'defer_alias']) {
-          delete entry[k];
+    if (Object.hasOwn(preState, conv)) {
+      withStateLock(() => {
+        const state = loadState();
+        if (Object.hasOwn(state, conv) && state[conv] && typeof state[conv] === 'object') {
+          const entry = { ...state[conv] };
+          for (const k of ['tries', 'zero_streak', 'dead', 'dead_reason', 'notified', 'defer_alias']) {
+            delete entry[k];
+          }
+          entry.ts = Date.now() / 1000;
+          state[conv] = entry;
+          saveState(state);
+          unlocked = true;
         }
-        entry.ts = Date.now() / 1000;
-        state[conv] = entry;
-        saveState(state);
-        unlocked = true;
-      }
-    });
+      });
+    }
     if (unlocked) {
       appendLog(`preinvocation compact_unlock conv=${conv}`);
       appendFlightEvent(process.env, {
@@ -331,6 +329,52 @@ function main() {
   const explicitOffload = hasExplicitOffload(lastRaw);
   const curSig = hasInputField ? inputSig(lastRaw) : '';
 
+  if (!explicitOff && !explicitOffload && !wsDir) {
+    const preState = loadState();
+    if (!Object.hasOwn(preState, conv)) {
+      const durationMs = Date.now() - t0;
+      if (durationMs >= SLOW_OP_THRESHOLD_MS) {
+        appendFlightEvent(process.env, {
+          level: 'warn',
+          source: 'hook-notice',
+          event: 'slow_hook',
+          conv,
+          durationMs,
+          message: `PreInvocation hook 执行较慢 (${durationMs}ms)`,
+        });
+      }
+      process.stdout.write('{}\n');
+      return;
+    }
+  }
+
+  const cfg = loadConfig(process.env);
+  const retryWindowSec = cfg.retryWindowMin * 60;
+  const maxRetry = cfg.maxRetry;
+  const { pluginVersion, ruleVersion } = getPluginRuleMeta(process.env);
+  const wsPaths = [
+    ...new Set(
+      [
+        ...(Array.isArray(payload.workspacePaths) ? payload.workspacePaths : []),
+        ...(payload.cwd ? [payload.cwd] : []),
+      ].filter((p) => typeof p === 'string' && p.trim()),
+    ),
+  ];
+  const hintPath = String(payload.transcriptPath || payload.artifactDirectoryPath || '');
+  let cachedCtController = null;
+  const getIsCtController = () => {
+    if (cachedCtController === null) {
+      cachedCtController = isActiveControlTowerController({
+        convId: conv,
+        workspacePaths: wsPaths,
+        env: process.env,
+        hintPath,
+        lastUserInput: lastRaw,
+      });
+    }
+    return cachedCtController;
+  };
+
   let output = null;
   let pendingConfigPatch = null;
   const pendingLogs = [];
@@ -346,7 +390,7 @@ function main() {
       const next = existingEntry ? { ...existingEntry } : {};
       next.offload_mode = false;
       next.ts = now;
-      if (wsDir && !isCtController) next.note_dir = wsDir;
+      if (wsDir && !getIsCtController()) next.note_dir = wsDir;
       if (curSig) next.last_input_sig = curSig;
       delete next.alias_injected;
       delete next.rule_rev;
@@ -364,7 +408,7 @@ function main() {
       return;
     }
 
-    if (isCtController && !explicitOffload && !existingEntry?.pending_orch_prompt && !(existingEntry?.offload_mode && existingEntry?.ct_confirmed)) {
+    if (getIsCtController() && !explicitOffload && !existingEntry?.pending_orch_prompt && !(existingEntry?.offload_mode && existingEntry?.ct_confirmed)) {
       return;
     }
 
@@ -392,7 +436,7 @@ function main() {
     if (Number.isInteger(initSteps) && Number.isInteger(prevStep) && initSteps <= prevStep) {
       pendingLogs.push(`preinvocation rewind_reset conv=${conv} prev_step=${prevStep} init_steps=${initSteps}`);
       pendingFlight.push({ level: 'info', event: 'rewind_reset', message: `步数回退 (${prevStep} -> ${initSteps})，重置会话状态` });
-      if ((explicitOffload || wsDir) && (!isCtController || explicitOffload)) {
+      if ((explicitOffload || wsDir) && (!getIsCtController() || explicitOffload)) {
         const keptDir = wsDir || entry.note_dir;
         entry = { ts: now };
         if (keptDir) entry.note_dir = keptDir;
@@ -409,7 +453,7 @@ function main() {
       }
     }
 
-    if (wsDir && entry.note_dir !== wsDir && (!isCtController || explicitOffload || entry.ct_confirmed)) {
+    if (wsDir && entry.note_dir !== wsDir && (!getIsCtController() || explicitOffload || entry.ct_confirmed)) {
       entry.note_dir = wsDir;
     }
 
@@ -431,7 +475,7 @@ function main() {
             pendingConfigPatch = { orchestratorConfirmedOnce: true };
           }
         }
-        if (reasons.includes('control_tower') || isCtController) {
+        if (reasons.includes('control_tower') || getIsCtController()) {
           entry.ct_confirmed = true;
         }
         entry.offload_mode = true;
@@ -456,7 +500,7 @@ function main() {
       } else {
         delete entry.pending_orch_prompt;
         delete entry.pending_confirm_reasons;
-        if (isCtController && !(entry.offload_mode && entry.ct_confirmed)) {
+        if (getIsCtController() && !(entry.offload_mode && entry.ct_confirmed)) {
           state[conv] = entry;
           saveState(state);
           pendingLogs.push(`preinvocation confirm_declined_ct conv=${conv}`);
@@ -476,7 +520,7 @@ function main() {
           needsOrchConfirm = !cfg.orchestratorConfirmedOnce;
         }
       }
-      const needsCtConfirm = !entry.ct_confirmed && isCtController;
+      const needsCtConfirm = !entry.ct_confirmed && getIsCtController();
       if (needsOrchConfirm || needsCtConfirm) {
         const reasons = [];
         if (needsOrchConfirm) reasons.push('orchestrator');

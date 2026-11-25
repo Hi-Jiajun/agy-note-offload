@@ -45,7 +45,22 @@ const PLAN_OFFLOAD_MODE =
   '若已全部完工，正文只回 1~3 行结论与 {dir}/status.md 链接。';
 
 const USER_REQ_RE = /<USER_REQUEST>([\s\S]*?)<\/USER_REQUEST>/;
+const FAST_TAIL_BYTES = 16_384;
 const TAIL_BYTES = 262_144;
+const EXIT_PLAN_TOOLS = new Set(['exit_plan_mode']);
+const ENTER_PLAN_TOOLS = new Set(['enter_plan_mode']);
+const DUAL_PHASE_TOOLS = new Set(['exit_plan_mode', 'enter_plan_mode']);
+
+function hasToolCall(rec, names) {
+  const calls = Array.isArray(rec?.tool_calls) ? rec.tool_calls : [];
+  for (const c of calls) {
+    const name = String(
+      typeof c === 'string' ? c : (c?.name || c?.tool_name || c?.function?.name || ''),
+    ).toLowerCase();
+    if (name && names.has(name)) return true;
+  }
+  return false;
+}
 
 function readStdinJson() {
   try {
@@ -55,6 +70,46 @@ function readStdinJson() {
     return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : {};
   } catch {
     return null;
+  }
+}
+
+function readLastRecordFast(transcriptPath) {
+  let fd = -1;
+  try {
+    const size = statSync(transcriptPath).size;
+    if (size <= 0) return { rec: null, needsFull: false };
+    const start = Math.max(0, size - FAST_TAIL_BYTES);
+    const len = size - start;
+    const buf = Buffer.allocUnsafe(len);
+    fd = openSync(transcriptPath, 'r');
+    const bytesRead = readSync(fd, buf, 0, len, start);
+    const lines = buf.subarray(0, bytesRead).toString('utf-8').split(/\r?\n/);
+    for (let i = lines.length - 1; i >= 0; i -= 1) {
+      const line = lines[i].trim();
+      if (!line) continue;
+      if (line.startsWith('{')) {
+        try {
+          const rec = JSON.parse(line);
+          if (rec && typeof rec === 'object' && !Array.isArray(rec)) {
+            return { rec, needsFull: false };
+          }
+        } catch {
+          // 末尾单条记录超过 16 KB 被截断或损坏时回退全窗解析
+        }
+      }
+      return { rec: null, needsFull: size > FAST_TAIL_BYTES };
+    }
+    return { rec: null, needsFull: false };
+  } catch {
+    return { rec: null, needsFull: false };
+  } finally {
+    if (fd >= 0) {
+      try {
+        closeSync(fd);
+      } catch {
+        // 忽略关闭异常
+      }
+    }
   }
 }
 
@@ -106,24 +161,50 @@ function extractLastUserInfo(recs) {
     return {
       sig: inputSig(body),
       dir: extractNoteDir(body),
+      body,
       explicitOn: hasExplicitOffload(body),
       explicitOff: hasExplicitOffloadOff(body),
     };
   }
-  return { sig: '', dir: '', explicitOn: false, explicitOff: false };
+  return { sig: '', dir: '', body: '', explicitOn: false, explicitOff: false };
 }
 
-function scanPlanSlice(recs, fromIdx, toIdx) {
+function isDualPhaseSession(recs) {
+  for (let i = recs.length - 1; i >= 0; i -= 1) {
+    const r = recs[i];
+    if (r.type === 'SYSTEM_MESSAGE') {
+      const c = String(r.content || '');
+      if (c.includes('Plan mode is off:') || c.includes('Plan mode is on:') || c.includes('[plan review]')) {
+        return true;
+      }
+    } else if (r.type === 'PLANNER_RESPONSE') {
+      if (hasToolCall(r, DUAL_PHASE_TOOLS)) return true;
+      if (r.model) {
+        const m = String(r.model).toLowerCase();
+        if (m.includes('orchestrator') || m.includes('worker')) return true;
+      }
+    }
+  }
+  return false;
+}
+
+function scanPlanSlice(recs, fromIdx, toIdx, lastIdx = recs.length - 1) {
   for (let i = fromIdx; i >= toIdx; i -= 1) {
     const r = recs[i];
     if (r.type === 'SYSTEM_MESSAGE') {
       const c = String(r.content || '');
       if (c.includes('Plan mode is off:')) return false;
       if (c.includes('Plan mode is on:') || c.includes('[plan review]')) return true;
-    } else if (r.type === 'PLANNER_RESPONSE' && r.model) {
-      const m = String(r.model).toLowerCase();
-      if (m.includes('orchestrator')) return true;
-      if (m.includes('worker')) return false;
+    } else if (r.type === 'PLANNER_RESPONSE') {
+      if (i < lastIdx) {
+        if (hasToolCall(r, ENTER_PLAN_TOOLS)) return true;
+        if (hasToolCall(r, EXIT_PLAN_TOOLS)) return false;
+      }
+      if (r.model) {
+        const m = String(r.model).toLowerCase();
+        if (m.includes('orchestrator')) return true;
+        if (m.includes('worker')) return false;
+      }
     }
   }
   return null;
@@ -142,12 +223,15 @@ function isPlanMode(rec, recs) {
     }
   }
 
-  const curTurn = scanPlanSlice(recs, recs.length - 1, lastUserIdx + 1);
+  const curTurn = scanPlanSlice(recs, recs.length - 1, lastUserIdx + 1, recs.length - 1);
   if (curTurn !== null) return curTurn;
 
-  if (lastUserIdx > 0) {
-    const prevTurn = scanPlanSlice(recs, lastUserIdx - 1, 0);
-    if (prevTurn !== null) return prevTurn;
+  if (!isDualPhaseSession(recs)) return false;
+
+  if (lastUserIdx >= 0) {
+    // 新版双阶段 Orchestrator 每次新 USER_INPUT 自动回到 Plan Mode（不再重复发 Plan mode is on:），
+    // 绝不跨过 lastUserIdx 继承上一轮的 Plan mode is off:
+    return !curModel.includes('hydrogen');
   }
 
   return false;
@@ -158,6 +242,44 @@ function isZeroOutputBlock(rec) {
   const thinking = String(rec.thinking || '').trim();
   const toolCalls = Array.isArray(rec.tool_calls) ? rec.tool_calls : [];
   return (outTokens === null || outTokens === undefined) && !thinking && toolCalls.length === 0;
+}
+
+const PERSISTED_KEYS = [
+  'alias_injected',
+  'offload_mode',
+  'note_dir',
+  'orch_confirmed',
+  'ct_confirmed',
+  'conflict_warned',
+  'pending_orch_prompt',
+  'rule_rev',
+  'rule_version',
+];
+
+const RETRY_RESET_KEYS = ['tries', 'zero_streak', 'dead', 'dead_reason', 'notified', 'defer_alias'];
+
+function finishHook({ t0, conv, decisionPayload, logLine, flightEvent }) {
+  const durationMs = Date.now() - t0;
+  if (logLine) {
+    appendLog(logLine);
+  }
+  if (flightEvent) {
+    appendFlightEvent(process.env, { ...flightEvent, durationMs });
+  } else if (durationMs >= SLOW_OP_THRESHOLD_MS) {
+    appendFlightEvent(process.env, {
+      level: 'warn',
+      source: 'hook-retry',
+      event: 'slow_hook',
+      conv,
+      durationMs,
+      message: `Stop hook 执行较慢 (${durationMs}ms)`,
+    });
+  }
+  if (!decisionPayload) {
+    process.stdout.write('{}\n');
+    return;
+  }
+  process.stdout.write(`${JSON.stringify(decisionPayload)}\n`);
 }
 
 function main() {
@@ -199,22 +321,85 @@ function main() {
     return;
   }
 
-  const recs = tailRecords(transcript);
-  if (!recs.length) {
+  const fast = readLastRecordFast(transcript);
+  let recs = null;
+  let rec = fast.rec;
+  if (fast.needsFull) {
+    recs = tailRecords(transcript);
+    rec = recs.length ? recs[recs.length - 1] : null;
+  }
+  if (!rec) {
     process.stdout.write('{}\n');
     return;
   }
 
-  const rec = recs[recs.length - 1];
   const now = Date.now() / 1000;
+  const curStep = rec.step_index;
+  const body = typeof rec.content === 'string' ? rec.content : '';
+  const isBlocked = body.includes(MARKER) && body.length <= 600;
+
+  if (!isBlocked) {
+    const preState = loadState();
+    if (!Object.hasOwn(preState, conv)) {
+      finishHook({ t0, conv, decisionPayload: null, logLine: '', flightEvent: null });
+      return;
+    }
+
+    withStateLock(() => {
+      const state = loadState();
+      if (!Object.hasOwn(state, conv)) return;
+      const entry = state[conv] && typeof state[conv] === 'object' ? state[conv] : {};
+      const prevStep = entry.step;
+      const rewound = Number.isInteger(curStep) && Number.isInteger(prevStep) && curStep < prevStep;
+      if (rewound) {
+        appendLog(`stop conv=${conv} rewind_reset prev_step=${prevStep} cur_step=${curStep}`);
+        appendFlightEvent(process.env, {
+          level: 'info',
+          source: 'hook-retry',
+          event: 'rewind_reset',
+          conv,
+          message: `检测到步数回退 (${prevStep} -> ${curStep})，已重置重试计数`,
+        });
+      }
+
+      const next = rewound ? {} : { ...entry };
+      for (const k of RETRY_RESET_KEYS) {
+        delete next[k];
+      }
+      if (rewound) {
+        for (const k of Object.keys(next)) {
+          if (!PERSISTED_KEYS.includes(k)) delete next[k];
+        }
+      }
+      next.step = curStep;
+      next.ts = now;
+      if (PERSISTED_KEYS.some((k) => Boolean(next[k]))) {
+        state[conv] = next;
+      } else {
+        delete state[conv];
+      }
+      saveState(state);
+    });
+
+    finishHook({ t0, conv, decisionPayload: null, logLine: '', flightEvent: null });
+    return;
+  }
+
+  if (!recs) {
+    recs = tailRecords(transcript);
+    if (!recs.length) {
+      finishHook({ t0, conv, decisionPayload: null, logLine: '', flightEvent: null });
+      return;
+    }
+    rec = recs[recs.length - 1];
+  }
+
   const cfg = loadConfig(process.env);
   const retryWindowSec = cfg.retryWindowMin * 60;
   const maxRetry = cfg.maxRetry;
   const zeroOutLimit = cfg.zeroOutLimit;
   const longAnswerThreshold = cfg.longAnswerTokens;
   const bigContextThreshold = cfg.bigContextTokens;
-  const curStep = rec.step_index;
-  const body = typeof rec.content === 'string' ? rec.content : '';
   const uInfo = extractLastUserInfo(recs);
   const wsPaths = [
     ...new Set(
@@ -229,6 +414,7 @@ function main() {
     workspacePaths: wsPaths,
     env: process.env,
     hintPath: transcript,
+    lastUserInput: uInfo.body,
   });
 
   let decisionPayload = null;
@@ -251,7 +437,7 @@ function main() {
         message: `检测到步数回退 (${prevStep} -> ${curStep})，已重置重试计数`,
       });
       const kept = {};
-      for (const k of ['alias_injected', 'offload_mode', 'note_dir', 'orch_confirmed', 'ct_confirmed', 'conflict_warned', 'rule_rev', 'rule_version']) {
+      for (const k of PERSISTED_KEYS) {
         if (entry[k]) kept[k] = entry[k];
       }
       entry = kept;
@@ -268,31 +454,13 @@ function main() {
     if (!managed) {
       if (Object.hasOwn(state, conv)) {
         const keep = { ...entry };
-        for (const k of ['tries', 'zero_streak', 'dead', 'dead_reason', 'notified', 'defer_alias']) {
+        for (const k of RETRY_RESET_KEYS) {
           delete keep[k];
         }
         if (keep.offload_mode || keep.note_dir) {
           keep.step = curStep;
           keep.ts = now;
           state[conv] = keep;
-        } else {
-          delete state[conv];
-        }
-        saveState(state);
-      }
-      return;
-    }
-
-    if (!body.includes(MARKER) || body.length > 600) {
-      if (Object.hasOwn(state, conv)) {
-        const entryKeep = rewound ? {} : { ...state[conv] };
-        for (const k of ['tries', 'zero_streak', 'dead', 'dead_reason', 'notified', 'defer_alias']) {
-          delete entryKeep[k];
-        }
-        entryKeep.step = curStep;
-        entryKeep.ts = now;
-        if (entryKeep.alias_injected || entryKeep.offload_mode || entryKeep.note_dir || entryKeep.orch_confirmed || entryKeep.ct_confirmed || entryKeep.rule_rev || entryKeep.rule_version) {
-          state[conv] = entryKeep;
         } else {
           delete state[conv];
         }
@@ -314,7 +482,7 @@ function main() {
     }
 
     const preserved = {};
-    for (const k of ['alias_injected', 'offload_mode', 'note_dir', 'last_input_sig', 'orch_confirmed', 'ct_confirmed', 'conflict_warned', 'rule_rev', 'rule_version']) {
+    for (const k of [...PERSISTED_KEYS, 'last_input_sig']) {
       if (entry[k]) preserved[k] = entry[k];
     }
 
@@ -417,27 +585,7 @@ function main() {
     decisionPayload = { decision: 'continue', reason };
   });
 
-  const durationMs = Date.now() - t0;
-  if (logLine) {
-    appendLog(logLine);
-  }
-  if (flightEvent) {
-    appendFlightEvent(process.env, { ...flightEvent, durationMs });
-  } else if (durationMs >= SLOW_OP_THRESHOLD_MS) {
-    appendFlightEvent(process.env, {
-      level: 'warn',
-      source: 'hook-retry',
-      event: 'slow_hook',
-      conv,
-      durationMs,
-      message: `Stop hook 执行较慢 (${durationMs}ms)`,
-    });
-  }
-  if (!decisionPayload) {
-    process.stdout.write('{}\n');
-    return;
-  }
-  process.stdout.write(`${JSON.stringify(decisionPayload)}\n`);
+  finishHook({ t0, conv, decisionPayload, logLine, flightEvent });
 }
 
 try {

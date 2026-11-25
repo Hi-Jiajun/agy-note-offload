@@ -554,4 +554,131 @@ describe('hooks 生命周期：按需零污染、Orchestrator 确认、Stop 递�
       lastUserInput: '再检查一次',
     }, sb.env), '{}');
   });
+
+  it('新版双阶段 Orchestrator 识别、跨轮 Plan Mode 自动重置、enter_plan_mode 与总控首轮交接防误绑', () => {
+    const sb = newSandbox();
+    const stateFile = join(sb.dataDir, '.filter-retry-state.json');
+
+    // 1. 新版轨迹无 orchestrator 字样：USER_SETTINGS_CHANGE Gemini 4 Neon + exit_plan_mode + Plan mode is off + Hydrogen
+    const dualTranscript = join(sb.root, 'dual-phase.jsonl');
+    writeTranscript(dualTranscript, [
+      { step_index: 1, type: 'USER_INPUT', content: '<USER_SETTINGS_CHANGE>\nModel Selection: from None to Gemini 4 Neon (XHigh)\n</USER_SETTINGS_CHANGE>' },
+      { step_index: 2, type: 'USER_INPUT', content: '<USER_REQUEST>\n规划阶段\n</USER_REQUEST>' },
+      { step_index: 3, type: 'PLANNER_RESPONSE', model: 'gemini-4-neon-xhigh', tool_calls: [{ name: 'exit_plan_mode' }] },
+      { step_index: 4, type: 'SYSTEM_MESSAGE', content: 'Plan mode is off: this turn runs on the execution model.' },
+      { step_index: 5, type: 'PLANNER_RESPONSE', model: 'gemini-4-hydrogen-high', content: 'executing' },
+    ]);
+
+    const cardOut = JSON.parse(runHook(NOTICE, {
+      conversationId: 'neworch1',
+      transcriptPath: dualTranscript,
+      lastUserInput: '/note-offload 开始新一轮任务',
+    }, sb.env));
+    assert.equal(cardOut.terminationBehavior, 'terminate');
+    assert.match(cardOut.injectSteps[0].systemMessage.metadata.user_markdown, /Orchestrator 模式启用落盘提醒/);
+
+    const confirmOut = JSON.parse(runHook(NOTICE, {
+      conversationId: 'neworch1',
+      transcriptPath: dualTranscript,
+      lastUserInput: '确认',
+    }, sb.env));
+    assert.match(confirmOut.injectSteps[1].systemMessage.systemMessage, /enter_plan_mode/);
+
+    // 若随后切到非双阶段单模型（无后续 exit/enter/Plan mode 标记），PreInvocation 不再判定为 Orchestrator
+    saveConfig({ orchestratorConfirm: 'per_session', orchestratorConfirmedOnce: false }, sb.env);
+    const switchedTranscript = join(sb.root, 'switched-single.jsonl');
+    writeTranscript(switchedTranscript, [
+      { step_index: 1, type: 'SYSTEM_MESSAGE', content: 'Plan mode is off: this turn runs on the execution model.' },
+      { step_index: 2, type: 'USER_INPUT', content: '<USER_SETTINGS_CHANGE>\nModel Selection: from Gemini 4 Neon to Gemini 4 Flash\n</USER_SETTINGS_CHANGE>' },
+      { step_index: 3, type: 'PLANNER_RESPONSE', model: 'gemini-4-flash', content: 'plain single model' },
+    ]);
+    const switchedOut = JSON.parse(runHook(NOTICE, {
+      conversationId: 'switched1',
+      transcriptPath: switchedTranscript,
+      lastUserInput: '/note-offload 普通模型执行',
+    }, sb.env));
+    assert.equal(switchedOut.terminationBehavior, undefined);
+    assert.match(switchedOut.injectSteps[0].systemMessage.systemMessage, /\[落盘模式\]/);
+
+    // 2. Stop: Turn 2 新 USER_INPUT 自动回到 Plan Mode（无 Plan mode is on），Neon 被阻断走 [规划精简]
+    const turn2ResetT = join(sb.root, 'turn2-reset.jsonl');
+    writeTranscript(turn2ResetT, [
+      { step_index: 1, type: 'USER_INPUT', content: '<USER_REQUEST>\n/note-offload Turn1\n</USER_REQUEST>' },
+      { step_index: 2, type: 'PLANNER_RESPONSE', model: 'gemini-4-neon-xhigh', tool_calls: [{ name: 'exit_plan_mode' }] },
+      { step_index: 3, type: 'SYSTEM_MESSAGE', content: 'Plan mode is off: this turn runs on the execution model.' },
+      { step_index: 4, type: 'PLANNER_RESPONSE', model: 'gemini-4-hydrogen-high', content: 'turn 1 complete' },
+      { step_index: 5, type: 'USER_INPUT', content: '<USER_REQUEST>\n/note-offload Turn2 新需求\n</USER_REQUEST>' },
+      { step_index: 6, type: 'PLANNER_RESPONSE', model: 'gemini-4-neon-xhigh', output_tokens: 720, content: "This request was blocked by Gemini's filters." },
+    ]);
+    const turn2Out = runHook(RETRY, { transcriptPath: turn2ResetT, conversationId: 'new-pm-t2' }, sb.env);
+    assert.match(turn2Out, /\[规划精简\]/);
+    assert.match(turn2Out, /exit_plan_mode/);
+
+    // 3. Stop: 执行模型 gemini-4-hydrogen-high 在 Plan mode is off 后受限 -> Tier 1/2，而非 [规划精简]
+    const execBlockT = join(sb.root, 'exec-block.jsonl');
+    writeTranscript(execBlockT, [
+      { step_index: 1, type: 'USER_INPUT', content: '<USER_REQUEST>\n/note-offload 执行\n</USER_REQUEST>' },
+      { step_index: 2, type: 'PLANNER_RESPONSE', model: 'gemini-4-neon-xhigh', tool_calls: [{ name: 'exit_plan_mode' }] },
+      { step_index: 3, type: 'SYSTEM_MESSAGE', content: 'Plan mode is off: this turn runs on the execution model.' },
+      { step_index: 4, type: 'PLANNER_RESPONSE', model: 'gemini-4-hydrogen-high', output_tokens: 300, thinking: 't', content: "This request was blocked by Gemini's filters." },
+    ]);
+    const execOut = runHook(RETRY, { transcriptPath: execBlockT, conversationId: 'new-exec-1' }, sb.env);
+    assert.match(execOut, /\[重写\]|\[落盘\]/);
+    assert.doesNotMatch(execOut, /\[规划精简\]/);
+
+    // 4. Stop: enter_plan_mode -> [plan review] Plan mode is on -> [规划精简]
+    const revT = join(sb.root, 'rev-block.jsonl');
+    writeTranscript(revT, [
+      { step_index: 1, type: 'USER_INPUT', content: '<USER_REQUEST>\n/note-offload 复核\n</USER_REQUEST>' },
+      { step_index: 2, type: 'SYSTEM_MESSAGE', content: 'Plan mode is off: this turn runs on the execution model.' },
+      { step_index: 3, type: 'PLANNER_RESPONSE', model: 'gemini-4-hydrogen-high', tool_calls: [{ name: 'enter_plan_mode' }] },
+      { step_index: 4, type: 'SYSTEM_MESSAGE', content: '[plan review] Plan mode is on: this turn runs on the planning model.' },
+      { step_index: 5, type: 'PLANNER_RESPONSE', model: 'gemini-4-neon-xhigh', output_tokens: 680, content: "This request was blocked by Gemini's filters." },
+    ]);
+    assert.match(runHook(RETRY, { transcriptPath: revT, conversationId: 'new-rev-1' }, sb.env), /\[规划精简\]/);
+
+    // 5. Stop: 纯单模型 gemini-4-neon-xhigh（无任何双阶段信号）不误判 Plan Mode
+    const plainSingleT = join(sb.root, 'plain-neon.jsonl');
+    writeTranscript(plainSingleT, [
+      { step_index: 1, type: 'USER_INPUT', content: '<USER_REQUEST>\n/note-offload 普通单模型\n</USER_REQUEST>' },
+      { step_index: 2, type: 'PLANNER_RESPONSE', model: 'gemini-4-neon-xhigh', output_tokens: 300, thinking: 't', content: "This request was blocked by Gemini's filters." },
+    ]);
+    const plainOut = runHook(RETRY, { transcriptPath: plainSingleT, conversationId: 'plain-neon-1' }, sb.env);
+    assert.match(plainOut, /\[重写\]/);
+    assert.doesNotMatch(plainOut, /\[规划精简\]/);
+
+    // 6. control-tower step-0 换届接班（台账尚指向前任 ID）豁免静默误绑，同工作区普通子任务仍正常静默绑定，显式 /note-offload 弹确认卡
+    const wsRepo = join(sb.root, 'ct-handover-ws');
+    mkdirSync(join(wsRepo, '.agents'), { recursive: true });
+    const prevCt = 'prev0001-aaaa-bbbb-cccc-ddddeeeeffff';
+    const nextCt = 'a3e9fff2-1111-2222-3333-444455556666';
+    writeFileSync(
+      join(wsRepo, '.agents', 'SESSION-REGISTRY.md'),
+      `- **当前现役总控会话**：[\`prev0001\`](conversation://${prevCt}) | 状态：\`ONLINE\`\n`,
+      'utf-8',
+    );
+    const step0Out = runHook(NOTICE, {
+      conversationId: nextCt,
+      workspacePaths: [wsRepo],
+      lastUserInput: '请先接管常驻主交流总控，先读前任交接 ~/agy-notes/prev0001/handover.md 再更新台账',
+    }, sb.env);
+    assert.equal(step0Out, '{}');
+    assert.equal(Object.hasOwn(JSON.parse(readFileSync(stateFile, 'utf-8')), nextCt), false);
+
+    const subTaskOut = runHook(NOTICE, {
+      conversationId: 'subw0001-1111-2222-3333-444455556666',
+      workspacePaths: [wsRepo],
+      lastUserInput: '请执行子任务并更新 ~/agy-notes/sub-work/status.md',
+    }, sb.env);
+    assert.equal(subTaskOut, '{}');
+    assert.equal(Object.hasOwn(JSON.parse(readFileSync(stateFile, 'utf-8')), 'subw0001-1111-2222-3333-444455556666'), true);
+
+    const explicitHandoverCard = JSON.parse(runHook(NOTICE, {
+      conversationId: nextCt,
+      workspacePaths: [wsRepo],
+      lastUserInput: '/note-offload 以常驻主交流总控身份强制开启落盘',
+    }, sb.env));
+    assert.equal(explicitHandoverCard.terminationBehavior, 'terminate');
+    assert.match(explicitHandoverCard.injectSteps[0].systemMessage.metadata.user_markdown, /control-tower 现役总控/);
+  });
 });

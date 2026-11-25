@@ -26,7 +26,7 @@ export const KEEP = [
   'neturl', 'net-map.tsv', 'https', 'http', 'md', 'hook',
   'decision', 'continue', 'reason', 'injectSteps', 'systemMessage',
   'metadata', 'user_markdown', 'terminationBehavior', 'terminate', 'note-offload',
-  'write_file', 'run_command', 'exit_plan_mode', 'agynote', 'task.md', 'status.md',
+  'write_file', 'run_command', 'exit_plan_mode', 'enter_plan_mode', 'agynote', 'task.md', 'status.md',
   'local', 'share', 'bin', 'agy-note-offload',
   'config', 'scripts', 'gemini', 'gw-', 'v1', 'v2',
   'agy-notes', 'turn-', 'read_file', 'offset', 'limit', 'misc', 'agysum', 'transcript',

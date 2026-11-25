@@ -176,6 +176,77 @@ function executeFixture(fixture) {
       return;
     }
 
+    if (fixture.kind === 'new_orchestrator_dual_phase') {
+      // 1) 新版双阶段：Turn 1 走完 Plan mode is off + Hydrogen，Turn 2 新 USER_INPUT 自动回到 Plan Mode（无 Plan mode is on）
+      const planTranscript = join(sb.root, 'new-orch-turn2-plan.jsonl');
+      const planRows = [
+        { step_index: 1, type: 'USER_INPUT', content: '<USER_REQUEST>\n/note-offload 第一轮修复\n</USER_REQUEST>' },
+        { step_index: 2, type: 'PLANNER_RESPONSE', model: 'gemini-4-neon-xhigh', tool_calls: [{ name: 'exit_plan_mode' }] },
+        { step_index: 3, type: 'SYSTEM_MESSAGE', content: 'Plan mode is off: this turn runs on the execution model.' },
+        { step_index: 4, type: 'PLANNER_RESPONSE', model: 'gemini-4-hydrogen-high', content: 'turn 1 done' },
+        { step_index: 5, type: 'USER_INPUT', content: '<USER_REQUEST>\n/note-offload 第二轮方案\n</USER_REQUEST>' },
+        { step_index: 6, type: 'PLANNER_RESPONSE', model: 'gemini-4-neon-xhigh', output_tokens: 920, content: "This request was blocked by Gemini's filters." },
+      ];
+      writeFileSync(planTranscript, `${planRows.map((r) => JSON.stringify(r)).join('\n')}\n`, 'utf-8');
+      const planOut = runHook(RETRY, { transcriptPath: planTranscript, conversationId: fixture.convId }, sb.env);
+      assert.match(planOut, /\[规划精简\]/);
+      assert.match(planOut, /exit_plan_mode/);
+
+      // 2) 新版双阶段执行阶段：exit_plan_mode + Plan mode is off + gemini-4-hydrogen-high 不应误判为 Plan Mode
+      const execTranscript = join(sb.root, 'new-orch-exec.jsonl');
+      const execRows = [
+        { step_index: 1, type: 'USER_INPUT', content: '<USER_REQUEST>\n/note-offload 执行重构\n</USER_REQUEST>' },
+        { step_index: 2, type: 'PLANNER_RESPONSE', model: 'gemini-4-neon-xhigh', tool_calls: [{ name: 'exit_plan_mode' }] },
+        { step_index: 3, type: 'SYSTEM_MESSAGE', content: 'Plan mode is off: this turn runs on the execution model.' },
+        { step_index: 4, type: 'PLANNER_RESPONSE', model: 'gemini-4-hydrogen-high', output_tokens: 400, thinking: 'ok', content: "This request was blocked by Gemini's filters." },
+      ];
+      writeFileSync(execTranscript, `${execRows.map((r) => JSON.stringify(r)).join('\n')}\n`, 'utf-8');
+      const execOut = runHook(RETRY, { transcriptPath: execTranscript, conversationId: fixture.execConvId }, sb.env);
+      assert.match(execOut, /\[重写\]|\[落盘\]/);
+      assert.doesNotMatch(execOut, /\[规划精简\]/);
+
+      // 3) 执行阶段调用 enter_plan_mode 回退 [plan review] 后应走规划精简
+      const revTranscript = join(sb.root, 'new-orch-enter-plan.jsonl');
+      const revRows = [
+        ...execRows.slice(0, 3),
+        { step_index: 4, type: 'PLANNER_RESPONSE', model: 'gemini-4-hydrogen-high', tool_calls: [{ name: 'enter_plan_mode' }] },
+        { step_index: 5, type: 'SYSTEM_MESSAGE', content: '[plan review] Plan mode is on: this turn runs on the planning model.' },
+        { step_index: 6, type: 'PLANNER_RESPONSE', model: 'gemini-4-neon-xhigh', output_tokens: 610, content: "This request was blocked by Gemini's filters." },
+      ];
+      writeFileSync(revTranscript, `${revRows.map((r) => JSON.stringify(r)).join('\n')}\n`, 'utf-8');
+      const revOut = runHook(RETRY, { transcriptPath: revTranscript, conversationId: fixture.reviewConvId }, sb.env);
+      assert.match(revOut, /\[规划精简\]/);
+
+      // 4) PreInvocation 通过新版无 orchestrator 字样轨迹识别双阶段 Orchestrator 并弹出零配额确认卡
+      const noticeCard = JSON.parse(runHook(NOTICE, {
+        conversationId: fixture.noticeConvId,
+        transcriptPath: revTranscript,
+        lastUserInput: '/note-offload 检查新版 Orchestrator 识别',
+      }, sb.env));
+      assert.equal(noticeCard.terminationBehavior, 'terminate');
+      assert.match(noticeCard.injectSteps[0].systemMessage.metadata.user_markdown, /Orchestrator 模式启用落盘提醒/);
+
+      // 5) control-tower 首轮换届交接在台账尚指向前任 ID 时仍豁免静默绑定
+      const wsCt = join(sb.root, 'ws-ct-handover');
+      mkdirSync(join(wsCt, '.agents'), { recursive: true });
+      const prevId = fixture.prevCtConvId;
+      writeFileSync(
+        join(wsCt, '.agents', 'SESSION-REGISTRY.md'),
+        `- **当前现役总控会话**：[\`${prevId.slice(0, 8)}\`](conversation://${prevId}) | 状态：\`ONLINE\`\n`,
+        'utf-8',
+      );
+      const handOut = runHook(NOTICE, {
+        conversationId: fixture.handoverConvId,
+        workspacePaths: [wsCt],
+        lastUserInput: `请接任常驻主交流总控并先阅读前任交接文档 ~/agy-notes/${prevId.slice(0, 8)}/handover.md`,
+      }, sb.env);
+      assert.equal(handOut, '{}');
+      const stFile = join(sb.dataDir, '.filter-retry-state.json');
+      const stObj = existsSync(stFile) ? JSON.parse(readFileSync(stFile, 'utf-8')) : {};
+      assert.equal(Object.hasOwn(stObj, fixture.handoverConvId), false);
+      return;
+    }
+
     throw new Error(`未知回放夹具类型: ${fixture.kind}`);
   } finally {
     sb.cleanup();

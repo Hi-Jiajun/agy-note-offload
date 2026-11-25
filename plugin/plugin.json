@@ -1,7 +1,7 @@
 {
   "name": "note-offload",
   "displayName": "Note Offload",
-  "version": "2.2.1",
+  "version": "2.2.2",
   "description": "Bidirectional file-backed task workspace (task.md / status.md / turn-N.md), silent 2-tier retry hooks with Plan Mode and context-lock awareness, and anti-spin recovery for Antigravity.",
   "author": "Hi-Jiajun",
   "homepage": "https://github.com/Hi-Jiajun/agy-note-offload",

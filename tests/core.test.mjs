@@ -8,7 +8,7 @@ import { promisify } from 'node:util';
 import { addAliasStrict, hasConfiguredAliases, upsertAlias } from '../plugin/lib/aliases.mjs';
 import { archiveWorkspace, loadArchivedMap, unarchiveWorkspace } from '../plugin/lib/archive.mjs';
 import { DEFAULT_CONFIG, loadConfig, resetConfig, saveConfig } from '../plugin/lib/config.mjs';
-import { detectConflicts, isActiveControlTowerController } from '../plugin/lib/conflicts.mjs';
+import { detectConflicts, isActiveControlTowerController, isControlTowerHandoverPrompt } from '../plugin/lib/conflicts.mjs';
 import { withFileLockSync } from '../plugin/lib/lock.mjs';
 import { ensureDataDir, getDataDir, getPluginRoot, getStatePath, shortPath } from '../plugin/lib/paths.mjs';
 import { applySanitizeIfEnabled, clean, latinLeftovers } from '../plugin/lib/sanitize.mjs';
@@ -366,5 +366,38 @@ describe('core 共享内核：路径隔离、配置可选项、冲突检测、�
       workspacePaths: [wsManaged],
     });
     assert.equal(issues.some((i) => i.code === 'control_tower_active_controller'), true);
+
+    // 3. step-0 总控换届接班提示仅在工作区确有台账且指令含换届语义时触发防误绑
+    assert.equal(isControlTowerHandoverPrompt('请按 /control-tower 规范接任常驻主交流总控'), true);
+    assert.equal(isControlTowerHandoverPrompt('请继续执行 ~/agy-notes/sub-task-1/task.md\n```md\n/control-tower\n```'), false);
+    assert.equal(
+      isActiveControlTowerController({
+        convId: 'next0002-1111-2222-3333-444455556666',
+        workspacePaths: [wsAgents],
+        env: sb.env,
+        lastUserInput: '请接任常驻主交流总控，阅读 ~/agy-notes/11223344/handover.md',
+      }),
+      true,
+    );
+    assert.equal(
+      isActiveControlTowerController({
+        convId: 'next0002-1111-2222-3333-444455556666',
+        workspacePaths: [wsAgents],
+        env: sb.env,
+        lastUserInput: '查看 ~/agy-notes/sub-task-1/status.md',
+      }),
+      false,
+    );
+    const wsNoRegistry = join(sb.root, 'ws-plain');
+    mkdirSync(wsNoRegistry, { recursive: true });
+    assert.equal(
+      isActiveControlTowerController({
+        convId: 'next0002-1111-2222-3333-444455556666',
+        workspacePaths: [wsNoRegistry],
+        env: sb.env,
+        lastUserInput: '请接任常驻主交流总控',
+      }),
+      false,
+    );
   });
 });

@@ -1,5 +1,20 @@
 # Changelog
 
+## [2.2.2] - 2026-11-25
+
+### Fixed
+- **全面兼容新版双阶段 `Orchestrator`（`Neon`/`Carbon` + `Hydrogen`）**：
+  - 修复 `hook-retry.mjs` 的 `isPlanMode`：精准识别 `exit_plan_mode` / `enter_plan_mode` 工具调用与 `[plan review] Plan mode is on:`，并在双阶段会话出现新一轮 `USER_INPUT` 时自动复位为 Plan Mode（不再跨 `lastUserIdx` 继承上一轮 `Plan mode is off:`，同时保持普通单模型 `Neon` 走正常阶梯续跑不误判）。
+  - 修复 `hook-notice.mjs` 的 `isOrchestratorSession`：兼容新版轨迹中模型字段不再含 `orchestrator`/`worker` 字样的情形，通过 `Plan mode is off:` / `Plan mode is on:` / `[plan review]` 与 `exit_plan_mode`/`enter_plan_mode` 工具调用识别双阶段会话，同时尊重后续切回单模型的 `<USER_SETTINGS_CHANGE>`。
+- **修复 `control-tower` 总控换届接班 Step-0 静默误绑**：`plugin/lib/conflicts.mjs` 新增 `isControlTowerHandoverPrompt` 与台账存在性联合守卫，在工作区确有 `SESSION-REGISTRY.md` 且接任首轮指令显式携带总控换届语义时豁免静默绑定，防止前任交接文档路径被误绑进状态账本（显式 `/note-offload` 仍正常弹出零配额确认卡）。
+- **修复 GitHub Actions CI 与 Release `L3 UI` 冒烟偶发竞态**：`scripts/offload-ui-smoke.mjs` 在 `finally` 及超时失败分支等待 `chrome` 与 `sidecar` 子进程彻底退出后再清理临时沙箱目录，补充 `--disable-crash-reporter` 等无头稳定参数并将冷启动超时提升至 `25s`；`tests/helpers/sandbox.mjs` 为 `rmSync` 增加重试退避，消除 `ENOTEMPTY` 与残留进程问题。
+
+### Changed
+- **Hook 热路径性能剪枝（消除普通回合 `slow_hook` 警告）**：
+  - `hook-notice.mjs` 提前处理 `/compact` 与未跟踪普通会话快出口：未含 `/note-offload`、退出开关及命名工作台路径且未入账会话直接零锁返回 `{}`，跳过全局配置读取与跨目录总控台账哈希扫描。
+  - `hook-retry.mjs` 新增 `16 KB` 尾部单行快探针：未命中过滤受限标记且未入账会话直接跳过 `256 KB` 全窗 JSON 解析、配置加载与台账扫描。
+- **补充 `enter_plan_mode` 回退交接规范**：更新 `OFFLOAD_RULE` 与 `SKILL.md`，要求执行阶段在调用 `enter_plan_mode` 回退规划复核前先将阶段进展写入 `turn-N.md` 与 `status.md`；补充 Ring 3 回放夹具 `R06`（`06-new-orchestrator-plan-mode.replay.json`）及对应单元测试。
+
 ## [2.2.1] - 2026-11-24
 
 ### Added

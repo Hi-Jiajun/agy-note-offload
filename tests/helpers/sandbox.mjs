@@ -49,7 +49,7 @@ export function createSandbox() {
     brainDirs: [brainApp, brainCli, brainIde],
     env,
     cleanup() {
-      rmSync(root, { recursive: true, force: true });
+      rmSync(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
     },
   };
 }

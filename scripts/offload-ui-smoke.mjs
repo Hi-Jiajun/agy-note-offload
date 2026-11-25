@@ -177,6 +177,34 @@ async function waitForCondition(fn, { timeoutMs = 6000, intervalMs = 80, label =
   throw new Error(`Timed out waiting for ${label}`);
 }
 
+async function killAndWait(proc, signal = 'SIGTERM', timeoutMs = 3000) {
+  if (!proc || proc.exitCode !== null || proc.signalCode !== null) return;
+  await new Promise((res) => {
+    let settled = false;
+    const finish = () => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      res();
+    };
+    const timer = setTimeout(() => {
+      try {
+        proc.kill('SIGKILL');
+      } catch {
+        // ignore
+      }
+      setTimeout(finish, 300);
+    }, timeoutMs);
+    proc.once('close', finish);
+    proc.once('exit', finish);
+    try {
+      proc.kill(signal);
+    } catch {
+      finish();
+    }
+  });
+}
+
 async function launchChrome(chromeBin, profileDir) {
   const proc = spawn(
     chromeBin,
@@ -186,6 +214,11 @@ async function launchChrome(chromeBin, profileDir) {
       '--disable-gpu',
       '--disable-dev-shm-usage',
       '--disable-extensions',
+      '--disable-crash-reporter',
+      '--no-first-run',
+      '--no-default-browser-check',
+      '--disable-background-networking',
+      '--disable-sync',
       '--remote-debugging-port=0',
       `--user-data-dir=${profileDir}`,
       'about:blank',
@@ -193,31 +226,39 @@ async function launchChrome(chromeBin, profileDir) {
     { stdio: ['ignore', 'pipe', 'pipe'] },
   );
 
-  let stderrBuf = '';
-  const wsBrowserUrl = await new Promise((res, rej) => {
-    const timer = setTimeout(() => rej(new Error(`Chrome failed to emit DevTools URL: ${stderrBuf.slice(-400)}`)), 12000);
-    proc.stderr.on('data', (chunk) => {
-      stderrBuf += chunk.toString('utf8');
-      const m = stderrBuf.match(/DevTools listening on (ws:\/\/127\.0\.0\.1:\d+\/[^\s]+)/);
-      if (m) {
+  try {
+    let stderrBuf = '';
+    const wsBrowserUrl = await new Promise((res, rej) => {
+      const timer = setTimeout(
+        () => rej(new Error(`Chrome failed to emit DevTools URL: ${stderrBuf.slice(-400)}`)),
+        25_000,
+      );
+      proc.stderr.on('data', (chunk) => {
+        stderrBuf += chunk.toString('utf8');
+        const m = stderrBuf.match(/DevTools listening on (ws:\/\/127\.0\.0\.1:\d+\/[^\s]+)/);
+        if (m) {
+          clearTimeout(timer);
+          res(m[1]);
+        }
+      });
+      proc.once('exit', (code) => {
         clearTimeout(timer);
-        res(m[1]);
-      }
+        rej(new Error(`Chrome exited early (${code}): ${stderrBuf.slice(-400)}`));
+      });
     });
-    proc.once('exit', (code) => {
-      clearTimeout(timer);
-      rej(new Error(`Chrome exited early (${code}): ${stderrBuf.slice(-400)}`));
-    });
-  });
 
-  const debugPort = wsBrowserUrl.match(/127\.0\.0\.1:(\d+)/)[1];
-  const targetsRes = await fetch(`http://127.0.0.1:${debugPort}/json/list`);
-  const targets = await targetsRes.json();
-  const pageTarget = targets.find((t) => t.type === 'page' && t.webSocketDebuggerUrl) || targets[0];
-  if (!pageTarget?.webSocketDebuggerUrl) {
-    throw new Error('Could not find CDP page target');
+    const debugPort = wsBrowserUrl.match(/127\.0\.0\.1:(\d+)/)[1];
+    const targetsRes = await fetch(`http://127.0.0.1:${debugPort}/json/list`);
+    const targets = await targetsRes.json();
+    const pageTarget = targets.find((t) => t.type === 'page' && t.webSocketDebuggerUrl) || targets[0];
+    if (!pageTarget?.webSocketDebuggerUrl) {
+      throw new Error('Could not find CDP page target');
+    }
+    return { proc, pageWsUrl: pageTarget.webSocketDebuggerUrl };
+  } catch (err) {
+    await killAndWait(proc, 'SIGKILL', 2000);
+    throw err;
   }
-  return { proc, pageWsUrl: pageTarget.webSocketDebuggerUrl };
 }
 
 export async function runUiSmoke({ requireBrowser = false } = {}) {
@@ -453,20 +494,10 @@ export async function runUiSmoke({ requireBrowser = false } = {}) {
     };
   } finally {
     if (cdp) cdp.close();
-    if (chromeProc) {
-      try {
-        chromeProc.kill('SIGKILL');
-      } catch {
-        // ignore
-      }
-    }
-    if (sidecarProc) {
-      try {
-        sidecarProc.kill('SIGTERM');
-      } catch {
-        // ignore
-      }
-    }
+    await Promise.all([
+      killAndWait(chromeProc, 'SIGKILL', 3000),
+      killAndWait(sidecarProc, 'SIGTERM', 3000),
+    ]);
     sb.cleanup();
   }
 }

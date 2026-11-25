@@ -85,9 +85,22 @@ function findControlTowerRegistries(workspacePaths, env = process.env, hintPath 
   return [...found];
 }
 
+const CT_HANDOVER_RE =
+  /(?:^|[\s([【（])\/control-tower(?=$|[\s)\]】），。！？,:;])|常驻主交流总控|换届接班|总控换届|接任(?:现役)?总控|接管(?:现役)?总控|新一任(?:现役)?总控/i;
+
 /**
- * 判断指定会话是否为任意工作区 control-tower 台账的现役总控会话。
- * @param {{ convId?: string, workspacePaths?: string[], env?: NodeJS.ProcessEnv, hintPath?: string }} [options]
+ * 判断用户输入是否显式发起 control-tower 总控换届接班或激活指令。
+ * @param {string} text
+ * @returns {boolean}
+ */
+export function isControlTowerHandoverPrompt(text) {
+  const cleaned = String(text || '').replace(/```[\s\S]*?```/g, ' ');
+  return CT_HANDOVER_RE.test(cleaned);
+}
+
+/**
+ * 判断指定会话是否为任意工作区 control-tower 台账的现役总控会话，或正在发起总控换届接班。
+ * @param {{ convId?: string, workspacePaths?: string[], env?: NodeJS.ProcessEnv, hintPath?: string, lastUserInput?: string }} [options]
  * @returns {boolean}
  */
 export function isActiveControlTowerController({
@@ -95,6 +108,7 @@ export function isActiveControlTowerController({
   workspacePaths = [],
   env = process.env,
   hintPath = '',
+  lastUserInput = '',
 } = {}) {
   try {
     if (!convId || !Array.isArray(workspacePaths) || workspacePaths.length === 0) return false;
@@ -102,6 +116,8 @@ export function isActiveControlTowerController({
     if (convShort.length < 4) return false;
 
     const registries = findControlTowerRegistries(workspacePaths, env, hintPath);
+    if (registries.length === 0) return false;
+
     for (const regPath of registries) {
       try {
         const lines = readFileSync(regPath, 'utf-8').split(/\r?\n/);
@@ -120,6 +136,10 @@ export function isActiveControlTowerController({
       } catch {
         // 忽略单个台账读取失败
       }
+    }
+
+    if (lastUserInput && isControlTowerHandoverPrompt(lastUserInput)) {
+      return true;
     }
   } catch {
     return false;

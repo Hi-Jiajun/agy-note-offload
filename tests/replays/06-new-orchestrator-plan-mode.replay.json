@@ -1,0 +1,11 @@
+{
+  "id": "R06",
+  "title": "新版双阶段 Orchestrator（Neon/Carbon + Hydrogen）跨轮自动回落 Plan Mode、enter_plan_mode 与 PreInvocation 识别",
+  "kind": "new_orchestrator_dual_phase",
+  "convId": "o6-plan-1111-2222-3333-444455556666",
+  "execConvId": "o6-exec-1111-2222-3333-444455556666",
+  "reviewConvId": "o6-revw-1111-2222-3333-444455556666",
+  "noticeConvId": "o6-notc-1111-2222-3333-444455556666",
+  "handoverConvId": "o6-hand-1111-2222-3333-444455556666",
+  "prevCtConvId": "prev0001-aaaa-bbbb-cccc-ddddeeeeffff"
+}

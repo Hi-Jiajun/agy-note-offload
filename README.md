@@ -1,6 +1,6 @@
 # agy-note-offload
 
-面向 **Google Antigravity** 的原生插件（**Note Offload** `v2.2.1`）：集成了**按需双向文件工作台（`task.md` / `status.md` / 连续递增 `turn-N.md`）**、**可编辑配置中心与 `Orchestrator` 首启一次性确认**、**落盘会话动态阈值自愈续跑与版本感知规则自动刷新**、**百级工作台增量缓存与逻辑/物理归档**、**黑匣子飞行诊断、节流钩子心跳与五环自进化门禁**、以及**可视化侧边栏 Aux Pane 面板**。
+面向 **Google Antigravity** 的原生插件（**Note Offload** `v2.2.2`）：集成了**按需双向文件工作台（`task.md` / `status.md` / 连续递增 `turn-N.md`）**、**可编辑配置中心与新版双阶段 `Orchestrator` 兼容**、**落盘会话动态阈值自愈续跑与版本感知规则自动刷新**、**百级工作台增量缓存与逻辑/物理归档**、**黑匣子飞行诊断、快路径剪枝与节流钩子心跳**、以及**可视化侧边栏 Aux Pane 面板**。
 
 ## 核心能力
 
@@ -8,7 +8,7 @@
 - **按需零污染与双向开关**：普通日常会话 `SessionStart` 仅静默清理旧状态，**零注入零干扰**；仅在显式发送 `/note-offload`（或 `[落盘模式]`/`[文件模式]`）时开启落盘纪律，支持随时发送 `/note-offload off`（或 `[退出落盘]`）同会话恢复常规详答。
 - **可视化侧边栏面板（`扩展 > Note Offload`）**：基于官方 `sidecar_sdk` 构建 Aux Pane Web UI，内置基于 `mtimeMs` 的百级工作台增量缓存、默认不断历史链接的逻辑归档与一键恢复、单工作台多会话历史展示、全量可编辑设置中心（含一键恢复默认）、任务勾选进度、状态筛选/排序、Markdown 表格与 Diff 富预览、防丢稿保护与黑匣子飞行诊断抽屉。
 - **双向文件交流（`agynote.mjs`）**：长篇需求放进 `task.md`，阶段进展同步更新 `status.md` 与按目录已有最大序号 `+ 1` 连续递增的 `turn-N.md`；支持 `archive [--move]` / `unarchive` / `reset` / `status --archived --dead --filter --json` 与完整 `config --reset`；每轮收尾控制在 1~3 行（`<= 150` 字结论正文 + 可点击 `file://` 路径链接），中间工具调用仅保留极简单句里程碑。
-- **`Orchestrator` 无损适配、首启一次性确认与版本感知刷新**：`Orchestrator` 启用确认默认采用**首启一次性（`once`）**，首次确认后全局记住（可随时在配置中心切换 `per_session` / `off` 或恢复默认；`control-tower` 现役总控始终坚持会话级安全确认）；平时解除 `exit_plan_mode` 15 行限制，规则版本绑定 `plugin.json` 版本号（`<version>#<rev>`），后续发版自动为存量活跃落盘会话刷新规则。
+- **`Orchestrator` 双阶段全兼容、首启一次性确认与版本感知刷新**：同时识别新版无 `orchestrator` 字样的双阶段模型（`gemini-4-neon-*`/`gemini-4-carbon-*` 规划 + `gemini-4-hydrogen-*` 执行、`exit_plan_mode` 与 `enter_plan_mode`、每轮新用户输入自动回到 Plan Mode）与经典模型；启用确认默认采用**首启一次性（`once`）**，首次确认后全局记住（可随时在配置中心切换 `per_session` / `off` 或恢复默认；`control-tower` 现役总控与换届接班首轮始终坚持严格安全保护）；平时解除 `exit_plan_mode` 15 行限制，规则版本绑定 `plugin.json` 版本号（`<version>#<rev>`），后续发版自动为存量活跃落盘会话刷新规则。
 - **收敛范围的 `Stop` 续跑与 `/compact` 解锁**：`Stop` 仅介入已开启落盘或已绑定命名工作台的会话（普通会话绝不被动建目录），所有重试与熔断阈值（`maxRetry` / `retryWindowMin` / `zeroOutLimit` / `longAnswerTokens` / `bigContextTokens`）均可动态配置；熔断后拦下短催促与原样重发，`/compact` 自动解除熔断状态。
 - **可选项词表中性化/别名注入与冲突检测**：`sanitize` 与 `neturl` 自动提示**默认关闭**，保留 `JSON`/`IPv4`/`sha256` 等常规工程术语；可通过 `agynote.mjs config` 或 Sidecar 面板按需启用，并配合 `agynote.mjs doctor` 自动扫描与 `control-tower`、MCP 服务名、多插件同事件 Hook 及 `PATH` 同名命令的冲突风险。
 - **跨端会话检索（`agysum.mjs`）**：自动跨桌面端（`antigravity`）、CLI（`antigravity-cli`）与 IDE（`antigravity-ide`）三端 `brain/` 目录检索旧会话 `transcript.jsonl`，大日志采用尾部分块快读，默认附带修改文件清单页脚，支持 `--tools`、`--search <kw>`、`--full` 与 `--json`。
@@ -17,7 +17,7 @@
 
 ```text
 note-offload/
-├── package.json                       # 单一版本源（2.2.1）与五环工程脚本
+├── package.json                       # 单一版本源（2.2.2）与五环工程脚本
 ├── AGENTS.md                          # 工程工作区协作与安全隔离规则
 ├── CHANGELOG.md                       # 版本变更记录
 ├── docs/ARCHITECTURE-ROADMAP.md       # L1 架构蓝图与五环自进化路线图
@@ -44,7 +44,7 @@ cd agy-note-offload
 agy plugin install ./plugin
 ```
 
-或下载 GitHub Release 中的 `note-offload-v2.2.1.zip` 解压后运行 `agy plugin install <解压目录>`。
+或下载 GitHub Release 中的 `note-offload-v2.2.2.zip` 解压后运行 `agy plugin install <解压目录>`。
 
 ### 方式二：使用本地安装器（含旧版本数据迁移与可选 CLI 软链）
 
