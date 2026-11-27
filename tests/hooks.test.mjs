@@ -681,4 +681,99 @@ describe('hooks 生命周期：按需零污染、Orchestrator 确认、Stop 递�
     assert.equal(explicitHandoverCard.terminationBehavior, 'terminate');
     assert.match(explicitHandoverCard.injectSteps[0].systemMessage.metadata.user_markdown, /control-tower 现役总控/);
   });
+
+  it('中后段回退保留落盘态且不重注规则、非受限 Stop 回退不丢状态，回退至启用步数及之前才重置', () => {
+    const sb = newSandbox();
+    const stateFile = join(sb.dataDir, '.filter-retry-state.json');
+    const transcript = join(sb.root, 'rewind-boundary.jsonl');
+
+    // 1. step 10 开启并绑定命名工作台，模拟推到 step 30 且经历过重试/熔断
+    const firstOut = JSON.parse(runHook(NOTICE, {
+      conversationId: 'rw-mid-1',
+      initialNumSteps: 10,
+      lastUserInput: '/note-offload 分析 ~/agy-notes/rw-ws/task.md',
+    }, sb.env));
+    assert.match(firstOut.injectSteps[0].systemMessage.systemMessage, /\[落盘模式\]/);
+
+    const st0 = JSON.parse(readFileSync(stateFile, 'utf-8'));
+    st0['rw-mid-1'].step = 30;
+    st0['rw-mid-1'].tries = 2;
+    st0['rw-mid-1'].dead = true;
+    st0['rw-mid-1'].dead_reason = 'max_retry';
+    writeFileSync(stateFile, JSON.stringify(st0));
+
+    // 中后段回退至 step 25（> 10）：清 tries/dead，不重注规则，保留 offload_mode 与 note_dir
+    assert.equal(runHook(NOTICE, {
+      conversationId: 'rw-mid-1',
+      initialNumSteps: 25,
+      lastUserInput: '继续看下一文件',
+    }, sb.env), '{}');
+    const stMid = JSON.parse(readFileSync(stateFile, 'utf-8'))['rw-mid-1'];
+    assert.equal(stMid.offload_mode, true);
+    assert.equal(stMid.alias_injected, true);
+    assert.equal(stMid.offload_step, 10);
+    assert.equal(stMid.tries, undefined);
+    assert.equal(stMid.dead, undefined);
+    assert.match(stMid.note_dir, /\/rw-ws$/);
+
+    // 紧接着在 step 26 受限，Stop 正常自动续跑
+    writeTranscript(transcript, [{
+      step_index: 26,
+      type: 'PLANNER_RESPONSE',
+      output_tokens: 300,
+      thinking: 't',
+      content: "This request was blocked by Gemini's filters.",
+    }]);
+    assert.match(runHook(RETRY, { conversationId: 'rw-mid-1', transcriptPath: transcript }, sb.env), /"decision":"continue"/);
+
+    // 2. 非受限 Stop 发生中后段回退（step 20 < 26，且 > offload_step 10）：保留 offload_mode 与 note_dir 并清 tries
+    writeTranscript(transcript, [{
+      step_index: 20,
+      type: 'PLANNER_RESPONSE',
+      content: 'normal finished',
+    }]);
+    assert.equal(runHook(RETRY, { conversationId: 'rw-mid-1', transcriptPath: transcript }, sb.env), '{}');
+    const stFast = JSON.parse(readFileSync(stateFile, 'utf-8'))['rw-mid-1'];
+    assert.equal(stFast.offload_mode, true);
+    assert.equal(stFast.offload_step, 10);
+    assert.equal(stFast.tries, undefined);
+
+    // 3. 受限 Stop 若回退至 offload_step 之前（step 5 < 10）：清空 offload_mode（未再带指令则不续跑）
+    stFast.step = 20;
+    writeFileSync(stateFile, JSON.stringify({ ...JSON.parse(readFileSync(stateFile, 'utf-8')), 'rw-mid-1': stFast }));
+    writeTranscript(transcript, [{
+      step_index: 5,
+      type: 'PLANNER_RESPONSE',
+      output_tokens: 300,
+      thinking: 't',
+      content: "This request was blocked by Gemini's filters.",
+    }]);
+    assert.equal(runHook(RETRY, { conversationId: 'rw-mid-1', transcriptPath: transcript }, sb.env), '{}');
+    assert.equal(JSON.parse(readFileSync(stateFile, 'utf-8'))['rw-mid-1'], undefined);
+
+    // 4. 在 step 0 启用后回退至 step 0 且保留 /note-offload -> 重新注入一次规则；去掉 /note-offload -> 清理状态
+    assert.match(runHook(NOTICE, {
+      conversationId: 'rw-zero-1',
+      initialNumSteps: 0,
+      lastUserInput: '/note-offload 首轮任务',
+    }, sb.env), /\[落盘模式\]/);
+    writeTranscript(transcript, [{ step_index: 12, type: 'PLANNER_RESPONSE', content: 'done' }]);
+    assert.equal(runHook(RETRY, { conversationId: 'rw-zero-1', transcriptPath: transcript }, sb.env), '{}');
+
+    const replayKeep = JSON.parse(runHook(NOTICE, {
+      conversationId: 'rw-zero-1',
+      initialNumSteps: 0,
+      lastUserInput: '/note-offload 重发首轮任务',
+    }, sb.env));
+    assert.match(replayKeep.injectSteps[0].systemMessage.systemMessage, /\[落盘模式\]/);
+
+    writeTranscript(transcript, [{ step_index: 4, type: 'PLANNER_RESPONSE', content: 'done' }]);
+    assert.equal(runHook(RETRY, { conversationId: 'rw-zero-1', transcriptPath: transcript }, sb.env), '{}');
+    assert.equal(runHook(NOTICE, {
+      conversationId: 'rw-zero-1',
+      initialNumSteps: 0,
+      lastUserInput: '去掉开关改成普通对话',
+    }, sb.env), '{}');
+    assert.equal(JSON.parse(readFileSync(stateFile, 'utf-8'))['rw-zero-1'], undefined);
+  });
 });

@@ -29,6 +29,7 @@ const EXPECTED = 'PreInvocation';
 const TAIL_BYTES = 131_072;
 const RULE_REV = 2;
 const DUAL_PHASE_TOOLS = new Set(['exit_plan_mode', 'enter_plan_mode']);
+const RETRY_RESET_KEYS = ['tries', 'zero_streak', 'dead', 'dead_reason', 'notified', 'defer_alias'];
 
 function hasToolCall(rec, names) {
   const calls = Array.isArray(rec?.tool_calls) ? rec.tool_calls : [];
@@ -299,7 +300,7 @@ function main() {
         const state = loadState();
         if (Object.hasOwn(state, conv) && state[conv] && typeof state[conv] === 'object') {
           const entry = { ...state[conv] };
-          for (const k of ['tries', 'zero_streak', 'dead', 'dead_reason', 'notified', 'defer_alias']) {
+          for (const k of RETRY_RESET_KEYS) {
             delete entry[k];
           }
           entry.ts = Date.now() / 1000;
@@ -385,6 +386,8 @@ function main() {
     const rawExisting = state[conv];
     const existingEntry = rawExisting && typeof rawExisting === 'object' && !Array.isArray(rawExisting) ? rawExisting : null;
     const now = Date.now() / 1000;
+    const initSteps = payload.initialNumSteps;
+    const curInitStep = Number.isInteger(initSteps) ? initSteps : 0;
 
     if (explicitOff) {
       const next = existingEntry ? { ...existingEntry } : {};
@@ -392,6 +395,8 @@ function main() {
       next.ts = now;
       if (wsDir && !getIsCtController()) next.note_dir = wsDir;
       if (curSig) next.last_input_sig = curSig;
+      delete next.offload_step;
+      delete next.rule_inject_step;
       delete next.alias_injected;
       delete next.rule_rev;
       delete next.rule_version;
@@ -418,7 +423,10 @@ function main() {
         return;
       }
       entry = { ts: now };
-      if (wsDir) entry.note_dir = wsDir;
+      if (wsDir) {
+        entry.note_dir = wsDir;
+        entry.bind_step = curInitStep;
+      }
       if (curSig) entry.last_input_sig = curSig;
       if (!explicitOffload) {
         state[conv] = entry;
@@ -431,30 +439,91 @@ function main() {
       entry = { ...entry };
     }
 
-    const initSteps = payload.initialNumSteps;
     const prevStep = entry.step;
     if (Number.isInteger(initSteps) && Number.isInteger(prevStep) && initSteps <= prevStep) {
-      pendingLogs.push(`preinvocation rewind_reset conv=${conv} prev_step=${prevStep} init_steps=${initSteps}`);
-      pendingFlight.push({ level: 'info', event: 'rewind_reset', message: `步数回退 (${prevStep} -> ${initSteps})，重置会话状态` });
-      if ((explicitOffload || wsDir) && (!getIsCtController() || explicitOffload)) {
-        const keptDir = wsDir || entry.note_dir;
-        entry = { ts: now };
-        if (keptDir) entry.note_dir = keptDir;
-        if (curSig) entry.last_input_sig = curSig;
-        if (!explicitOffload) {
-          state[conv] = entry;
+      const offloadStep = Number.isInteger(entry.offload_step) ? entry.offload_step : 0;
+      const ruleInjectStep = Number.isInteger(entry.rule_inject_step) ? entry.rule_inject_step : offloadStep;
+      const bindStep = Number.isInteger(entry.bind_step) ? entry.bind_step : offloadStep;
+      const rewoundPastOffload = Boolean(entry.offload_mode) && initSteps <= offloadStep;
+      const rewoundPastRule = Boolean(entry.alias_injected) && initSteps <= ruleInjectStep;
+      const rewoundPastBind = Boolean(entry.note_dir) && (!entry.offload_mode || rewoundPastOffload) && initSteps <= bindStep;
+
+      for (const k of RETRY_RESET_KEYS) {
+        delete entry[k];
+      }
+      delete entry.step;
+      delete entry.pending_orch_prompt;
+      delete entry.pending_confirm_reasons;
+      entry.ts = now;
+      if (curSig) entry.last_input_sig = curSig;
+
+      if (rewoundPastOffload || rewoundPastBind) {
+        pendingLogs.push(`preinvocation rewind_reset conv=${conv} prev_step=${prevStep} init_steps=${initSteps} scope=full`);
+        pendingFlight.push({
+          level: 'info',
+          event: 'rewind_reset',
+          message: `步数回退至启用前 (${prevStep} -> ${initSteps})，重置落盘状态`,
+          detail: { prevStep, initSteps, scope: 'full' },
+        });
+        if ((explicitOffload || wsDir) && (!getIsCtController() || explicitOffload)) {
+          const keptDir = wsDir || (initSteps > bindStep ? entry.note_dir : '');
+          entry = { ts: now };
+          if (keptDir) {
+            entry.note_dir = keptDir;
+            entry.bind_step = curInitStep;
+          }
+          if (curSig) entry.last_input_sig = curSig;
+          if (!explicitOffload) {
+            state[conv] = entry;
+            saveState(state);
+            return;
+          }
+        } else {
+          delete state[conv];
           saveState(state);
           return;
         }
       } else {
-        delete state[conv];
-        saveState(state);
-        return;
+        if (rewoundPastRule) {
+          delete entry.alias_injected;
+          delete entry.rule_rev;
+          delete entry.rule_version;
+          delete entry.rule_inject_step;
+        }
+        pendingLogs.push(`preinvocation rewind_reset conv=${conv} prev_step=${prevStep} init_steps=${initSteps} scope=retry_only`);
+        pendingFlight.push({
+          level: 'info',
+          event: 'rewind_reset',
+          message: `中后段步数回退 (${prevStep} -> ${initSteps})，仅清重试/熔断并保留落盘态`,
+          detail: { prevStep, initSteps, scope: 'retry_only', preservedOffload: Boolean(entry.offload_mode) },
+        });
+        if (wsDir && entry.note_dir !== wsDir && (!getIsCtController() || explicitOffload || entry.ct_confirmed)) {
+          entry.note_dir = wsDir;
+          if (!Number.isInteger(entry.bind_step)) entry.bind_step = curInitStep;
+        }
+        const hasAnySemanticState = Boolean(
+          entry.offload_mode || entry.note_dir || entry.alias_injected || entry.orch_confirmed || entry.ct_confirmed,
+        );
+        if (!hasAnySemanticState && !explicitOffload) {
+          delete state[conv];
+          saveState(state);
+          return;
+        }
+        if (
+          !explicitOffload &&
+          !rewoundPastRule &&
+          (!entry.alias_injected || (Number(entry.rule_rev || 0) >= RULE_REV && entry.rule_version === ruleVersion))
+        ) {
+          state[conv] = entry;
+          saveState(state);
+          return;
+        }
       }
     }
 
     if (wsDir && entry.note_dir !== wsDir && (!getIsCtController() || explicitOffload || entry.ct_confirmed)) {
       entry.note_dir = wsDir;
+      entry.bind_step = curInitStep;
     }
 
     const steps = [];
@@ -479,10 +548,12 @@ function main() {
           entry.ct_confirmed = true;
         }
         entry.offload_mode = true;
+        if (!Number.isInteger(entry.offload_step)) entry.offload_step = curInitStep;
         entry.ts = now;
         const savedWs = extractNoteDir(savedPrompt);
         if (savedWs && !entry.note_dir) {
           entry.note_dir = savedWs;
+          entry.bind_step = curInitStep;
         }
         if (!explicitOffload) {
           steps.push({ userMessage: savedPrompt });
@@ -555,6 +626,7 @@ function main() {
         entry.orch_confirmed = true;
       }
       entry.offload_mode = true;
+      if (!Number.isInteger(entry.offload_step)) entry.offload_step = curInitStep;
     }
 
     const withinWindow = now - Number(entry.ts || 0) <= retryWindowSec;
@@ -629,6 +701,7 @@ function main() {
       entry.alias_injected = true;
       entry.rule_rev = RULE_REV;
       entry.rule_version = ruleVersion;
+      entry.rule_inject_step = curInitStep;
       const noteDir = resolveNoteDir(conv, entry, { create: false });
       let ruleTpl = isUpgradeRefresh
         ? `[落盘模式规则已升级 v${pluginVersion}] 请以以下新版规则替代本会话历史消息中的旧版落盘限制：\n${OFFLOAD_RULE}`

@@ -247,6 +247,78 @@ function executeFixture(fixture) {
       return;
     }
 
+    if (fixture.kind === 'rewind_preserves_offload') {
+      const stateFile = join(sb.dataDir, '.filter-retry-state.json');
+      const convId = fixture.convId;
+
+      // 1) step 0 启用落盘并注入一次规则
+      const initOut = JSON.parse(runHook(NOTICE, {
+        conversationId: convId,
+        initialNumSteps: 0,
+        lastUserInput: '/note-offload 启动分析',
+      }, sb.env));
+      assert.match(initOut.injectSteps[0].systemMessage.systemMessage, /\[落盘模式\]/);
+
+      // 2) Stop 推高 step 至 159（模拟正常进度完成）
+      const tPath = join(sb.root, 'rewind-r07.jsonl');
+      writeFileSync(tPath, `${JSON.stringify({ step_index: 159, type: 'PLANNER_RESPONSE', content: 'done' })}\n`, 'utf-8');
+      assert.equal(runHook(RETRY, { conversationId: convId, transcriptPath: tPath }, sb.env), '{}');
+
+      // 3) 撤回重发退至 step 157（无 /note-offload）：不丢落盘态、不重复注规则
+      assert.equal(runHook(NOTICE, {
+        conversationId: convId,
+        initialNumSteps: 157,
+        lastUserInput: '/boost 继续分析',
+      }, sb.env), '{}');
+      const midSt = JSON.parse(readFileSync(stateFile, 'utf-8'))[convId];
+      assert.equal(midSt.offload_mode, true);
+      assert.equal(midSt.alias_injected, true);
+      assert.equal(midSt.offload_step, 0);
+
+      // 4) 随后在 step 158 遭遇过滤受限：Stop 依然自动触发续跑
+      writeFileSync(tPath, `${JSON.stringify({
+        step_index: 158,
+        type: 'PLANNER_RESPONSE',
+        output_tokens: 461,
+        thinking: 't',
+        content: "This request was blocked by Gemini's filters.",
+      })}\n`, 'utf-8');
+      assert.match(runHook(RETRY, { conversationId: convId, transcriptPath: tPath }, sb.env), /"decision":"continue"/);
+
+      // 5) 中后段带 /note-offload 再次回退：仍不重复注入规则
+      assert.equal(runHook(NOTICE, {
+        conversationId: convId,
+        initialNumSteps: 156,
+        lastUserInput: '/note-offload 继续',
+      }, sb.env), '{}');
+
+      // 6) 非受限 Stop 发生步数回退（150 < 158）：保留 offload_mode 并清 tries
+      writeFileSync(tPath, `${JSON.stringify({ step_index: 150, type: 'PLANNER_RESPONSE', content: 'ok' })}\n`, 'utf-8');
+      assert.equal(runHook(RETRY, { conversationId: convId, transcriptPath: tPath }, sb.env), '{}');
+      const afterFastRewind = JSON.parse(readFileSync(stateFile, 'utf-8'))[convId];
+      assert.equal(afterFastRewind.offload_mode, true);
+      assert.equal(afterFastRewind.tries, undefined);
+
+      // 7) 启用前全量重置：在 step 10 开启，推到 step 25 后退回 step 5 且去掉 /note-offload -> 彻底退出并删状态
+      const fullId = fixture.fullRewindConvId;
+      assert.match(runHook(NOTICE, {
+        conversationId: fullId,
+        initialNumSteps: 10,
+        lastUserInput: '/note-offload 中途开启',
+      }, sb.env), /\[落盘模式\]/);
+      const fullT = join(sb.root, 'rewind-r07-full.jsonl');
+      writeFileSync(fullT, `${JSON.stringify({ step_index: 25, type: 'PLANNER_RESPONSE', content: 'ok' })}\n`, 'utf-8');
+      assert.equal(runHook(RETRY, { conversationId: fullId, transcriptPath: fullT }, sb.env), '{}');
+      assert.equal(runHook(NOTICE, {
+        conversationId: fullId,
+        initialNumSteps: 5,
+        lastUserInput: '改问普通问题',
+      }, sb.env), '{}');
+      const fullObj = JSON.parse(readFileSync(stateFile, 'utf-8'));
+      assert.equal(Object.hasOwn(fullObj, fullId), false);
+      return;
+    }
+
     throw new Error(`未知回放夹具类型: ${fixture.kind}`);
   } finally {
     sb.cleanup();

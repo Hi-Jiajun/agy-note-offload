@@ -1,6 +1,6 @@
 # agy-note-offload
 
-面向 **Google Antigravity** 的原生插件（**Note Offload** `v2.2.2`）：集成了**按需双向文件工作台（`task.md` / `status.md` / 连续递增 `turn-N.md`）**、**可编辑配置中心与新版双阶段 `Orchestrator` 兼容**、**落盘会话动态阈值自愈续跑与版本感知规则自动刷新**、**百级工作台增量缓存与逻辑/物理归档**、**黑匣子飞行诊断、快路径剪枝与节流钩子心跳**、以及**可视化侧边栏 Aux Pane 面板**。
+面向 **Google Antigravity** 的原生插件（**Note Offload** `v2.2.3`）：集成了**按需双向文件工作台（`task.md` / `status.md` / 连续递增 `turn-N.md`）**、**可编辑配置中心与新版双阶段 `Orchestrator` 兼容**、**落盘会话动态阈值自愈续跑与版本感知规则自动刷新**、**百级工作台增量缓存与逻辑/物理归档**、**黑匣子飞行诊断、快路径剪枝与节流钩子心跳**、以及**可视化侧边栏 Aux Pane 面板**。
 
 ## 核心能力
 
@@ -17,7 +17,7 @@
 
 ```text
 note-offload/
-├── package.json                       # 单一版本源（2.2.2）与五环工程脚本
+├── package.json                       # 单一版本源（2.2.3）与五环工程脚本
 ├── AGENTS.md                          # 工程工作区协作与安全隔离规则
 ├── CHANGELOG.md                       # 版本变更记录
 ├── docs/ARCHITECTURE-ROADMAP.md       # L1 架构蓝图与五环自进化路线图
@@ -44,7 +44,7 @@ cd agy-note-offload
 agy plugin install ./plugin
 ```
 
-或下载 GitHub Release 中的 `note-offload-v2.2.2.zip` 解压后运行 `agy plugin install <解压目录>`。
+或下载 GitHub Release 中的 `note-offload-v2.2.3.zip` 解压后运行 `agy plugin install <解压目录>`。
 
 ### 方式二：使用本地安装器（含旧版本数据迁移与可选 CLI 软链）
 

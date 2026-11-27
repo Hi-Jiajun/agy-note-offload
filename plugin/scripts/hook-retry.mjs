@@ -252,11 +252,71 @@ const PERSISTED_KEYS = [
   'ct_confirmed',
   'conflict_warned',
   'pending_orch_prompt',
+  'offload_step',
+  'rule_inject_step',
+  'bind_step',
+  'rule_rev',
+  'rule_version',
+];
+
+const SEMANTIC_PERSISTED_KEYS = [
+  'alias_injected',
+  'offload_mode',
+  'note_dir',
+  'orch_confirmed',
+  'ct_confirmed',
+  'pending_orch_prompt',
   'rule_rev',
   'rule_version',
 ];
 
 const RETRY_RESET_KEYS = ['tries', 'zero_streak', 'dead', 'dead_reason', 'notified', 'defer_alias'];
+
+function copyPersistedKeys(entry, extraKeys = []) {
+  const out = {};
+  for (const k of [...PERSISTED_KEYS, ...extraKeys]) {
+    if (k.endsWith('_step')) {
+      if (Number.isInteger(entry[k])) out[k] = entry[k];
+    } else if (entry[k]) {
+      out[k] = entry[k];
+    }
+  }
+  return out;
+}
+
+function applyStopRewind(entry, curStep) {
+  const offloadStep = Number.isInteger(entry.offload_step) ? entry.offload_step : 0;
+  const ruleInjectStep = Number.isInteger(entry.rule_inject_step) ? entry.rule_inject_step : offloadStep;
+  const bindStep = Number.isInteger(entry.bind_step) ? entry.bind_step : offloadStep;
+  const rewoundPastOffload = Boolean(entry.offload_mode) && curStep < offloadStep;
+  const rewoundPastRule = Boolean(entry.alias_injected) && curStep < ruleInjectStep;
+
+  const next = copyPersistedKeys(entry);
+  if (rewoundPastOffload) {
+    delete next.offload_mode;
+    delete next.offload_step;
+    delete next.alias_injected;
+    delete next.rule_rev;
+    delete next.rule_version;
+    delete next.rule_inject_step;
+  } else if (rewoundPastRule) {
+    delete next.alias_injected;
+    delete next.rule_rev;
+    delete next.rule_version;
+    delete next.rule_inject_step;
+  }
+
+  const rewoundPastBind = Boolean(next.note_dir) && !next.offload_mode && curStep < bindStep;
+  if (rewoundPastBind) {
+    delete next.note_dir;
+    delete next.bind_step;
+  }
+
+  return {
+    next,
+    scope: rewoundPastOffload || rewoundPastBind ? 'full' : 'retry_only',
+  };
+}
 
 function finishHook({ t0, conv, decisionPayload, logLine, flightEvent }) {
   const durationMs = Date.now() - t0;
@@ -351,29 +411,28 @@ function main() {
       const entry = state[conv] && typeof state[conv] === 'object' ? state[conv] : {};
       const prevStep = entry.step;
       const rewound = Number.isInteger(curStep) && Number.isInteger(prevStep) && curStep < prevStep;
+      let next;
       if (rewound) {
-        appendLog(`stop conv=${conv} rewind_reset prev_step=${prevStep} cur_step=${curStep}`);
+        const res = applyStopRewind(entry, curStep);
+        next = res.next;
+        appendLog(`stop conv=${conv} rewind_reset prev_step=${prevStep} cur_step=${curStep} scope=${res.scope}`);
         appendFlightEvent(process.env, {
           level: 'info',
           source: 'hook-retry',
           event: 'rewind_reset',
           conv,
-          message: `检测到步数回退 (${prevStep} -> ${curStep})，已重置重试计数`,
+          message: `检测到步数回退 (${prevStep} -> ${curStep})，${res.scope === 'full' ? '已重置落盘态' : '已重置重试计数并保留落盘态'}`,
+          detail: { prevStep, curStep, scope: res.scope },
         });
-      }
-
-      const next = rewound ? {} : { ...entry };
-      for (const k of RETRY_RESET_KEYS) {
-        delete next[k];
-      }
-      if (rewound) {
-        for (const k of Object.keys(next)) {
-          if (!PERSISTED_KEYS.includes(k)) delete next[k];
+      } else {
+        next = { ...entry };
+        for (const k of RETRY_RESET_KEYS) {
+          delete next[k];
         }
       }
       next.step = curStep;
       next.ts = now;
-      if (PERSISTED_KEYS.some((k) => Boolean(next[k]))) {
+      if (SEMANTIC_PERSISTED_KEYS.some((k) => Boolean(next[k]))) {
         state[conv] = next;
       } else {
         delete state[conv];
@@ -428,19 +487,17 @@ function main() {
 
     const rewound = Number.isInteger(curStep) && Number.isInteger(prevStep) && curStep < prevStep;
     if (rewound) {
-      appendLog(`stop conv=${conv} rewind_reset prev_step=${prevStep} cur_step=${curStep}`);
+      const res = applyStopRewind(entry, curStep);
+      appendLog(`stop conv=${conv} rewind_reset prev_step=${prevStep} cur_step=${curStep} scope=${res.scope}`);
       appendFlightEvent(process.env, {
         level: 'info',
         source: 'hook-retry',
         event: 'rewind_reset',
         conv,
-        message: `检测到步数回退 (${prevStep} -> ${curStep})，已重置重试计数`,
+        message: `检测到步数回退 (${prevStep} -> ${curStep})，${res.scope === 'full' ? '已重置落盘态' : '已重置重试计数并保留落盘态'}`,
+        detail: { prevStep, curStep, scope: res.scope },
       });
-      const kept = {};
-      for (const k of PERSISTED_KEYS) {
-        if (entry[k]) kept[k] = entry[k];
-      }
-      entry = kept;
+      entry = res.next;
     }
 
     if (isCtController && !(entry.offload_mode && entry.ct_confirmed)) {
@@ -481,16 +538,16 @@ function main() {
       zeroStreak = zeroOut ? 1 : 0;
     }
 
-    const preserved = {};
-    for (const k of [...PERSISTED_KEYS, 'last_input_sig']) {
-      if (entry[k]) preserved[k] = entry[k];
-    }
+    const preserved = copyPersistedKeys(entry, ['last_input_sig']);
 
     entry = withinWindow ? { ...entry } : preserved;
 
     if (uInfo.sig && !entry.last_input_sig) entry.last_input_sig = uInfo.sig;
     if (uInfo.dir && !entry.note_dir) entry.note_dir = uInfo.dir;
-    if (uInfo.explicitOn) entry.offload_mode = true;
+    if (uInfo.explicitOn) {
+      entry.offload_mode = true;
+      if (!Number.isInteger(entry.offload_step)) entry.offload_step = 0;
+    }
 
     entry.step = curStep;
     entry.tries = tries;

@@ -6,7 +6,7 @@
 
 | 路径 | 职责说明 |
 | --- | --- |
-| `package.json` | 工程根配置与单一版本源（`2.2.2`） |
+| `package.json` | 工程根配置与单一版本源（`2.2.3`） |
 | `docs/ARCHITECTURE-ROADMAP.md` | L1 架构不变量与五环自进化演进蓝图（不打入运行态 `plugin/`） |
 | `plugin/` | 纯净运行态 Antigravity 原生插件包（`agy plugin validate ./plugin --strict` 零告警，支持整目录同步与 Release ZIP 分发） |
 | `plugin/plugin.json` | Antigravity 原生插件清单 |

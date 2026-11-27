@@ -1,5 +1,13 @@
 # Changelog
 
+## [2.2.3] - 2026-11-27
+
+### Fixed
+- **修复消息撤回与中后段步数回退（`rewind_reset`）误清落盘态问题**：
+  - 修复 `plugin/scripts/hook-notice.mjs` 在中后段发生 `initialNumSteps <= prevStep` 时整条删除 `state[conv]`，导致后续过滤受限回合无法自动续跑或重复注入 `[落盘模式]` 规则（`8dc44514` 与 `3c394ded` 实况故障）。
+  - 修复 `plugin/scripts/hook-retry.mjs` 非受限快速路径 `rewound ? {}` 误清空持久字段的问题。
+  - 引入启用步数边界追踪（`offload_step` / `rule_inject_step` / `bind_step`）：仅当步数回退至启用步数或更早之前才彻底重置落盘态，中后段回退仅清理重试与熔断计数并保留落盘开关及防重注状态；同步新增 Ring 3 回放夹具 `R07`（`07-rewind-preserves-offload.replay.json`）及单元测试。
+
 ## [2.2.2] - 2026-11-25
 
 ### Fixed
